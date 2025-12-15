@@ -140,18 +140,28 @@ async def run_server(host: str, port: int, tick_hz: float, max_cubes: int, seed:
 
     app = web.Application()
 
-    async def _serve_pkg_file(pkg_rel: str, content_type: str) -> web.Response:
-        with resources.files("cube_agent3d.web").joinpath(pkg_rel).open("rb") as f:
-            return web.Response(body=f.read(), content_type=content_type)
+    async def _serve_pkg_file(pkg_rel: str, content_type: str, *, charset: str | None = None) -> web.Response:
+        try:
+            p = resources.files("cube_agent3d.web").joinpath(pkg_rel)
+            with p.open("rb") as f:
+                data = f.read()
+        except FileNotFoundError:
+            raise web.HTTPNotFound(text=f"Not found: {pkg_rel}")
+        except Exception as e:
+            raise web.HTTPInternalServerError(text=f"Failed to load: {pkg_rel} ({e})")
+
+        if charset is not None:
+            return web.Response(body=data, content_type=content_type, charset=charset)
+        return web.Response(body=data, content_type=content_type)
 
     async def index(request: web.Request) -> web.Response:
-        return await _serve_pkg_file("index.html", "text/html; charset=utf-8")
+        return await _serve_pkg_file("index.html", "text/html", charset="utf-8")
 
     async def app_js(request: web.Request) -> web.Response:
-        return await _serve_pkg_file("app.js", "application/javascript; charset=utf-8")
+        return await _serve_pkg_file("app.js", "application/javascript", charset="utf-8")
 
     async def style_css(request: web.Request) -> web.Response:
-        return await _serve_pkg_file("style.css", "text/css; charset=utf-8")
+        return await _serve_pkg_file("style.css", "text/css", charset="utf-8")
 
     async def ws_handler(request: web.Request) -> web.WebSocketResponse:
         ws = web.WebSocketResponse(heartbeat=20)
