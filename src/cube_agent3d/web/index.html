@@ -3,20 +3,19 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Cube Agent 3D</title>
+  <title>cube-agent3d</title>
   <link rel="stylesheet" href="/style.css" />
 
-  <!-- 핵심: OrbitControls가 내부에서 "three"를 import하므로 importmap 필수 -->
+  <!-- ✅ 핵심: importmap으로 "three" / "three/addons/" 해결 -->
   <script type="importmap">
-    {
-      "imports": {
-        "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
-        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
-      }
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
     }
+  }
   </script>
 </head>
-
 <body>
   <div id="wrap">
     <div id="hud">
@@ -29,10 +28,8 @@
         <button id="btnZoomReset">ZOOM RESET</button>
       </div>
 
-      <div class="row small">
-        <div id="status">연결 대기</div>
-      </div>
-      <div class="small" id="meta"></div>
+      <div class="small" id="status">연결 대기</div>
+      <div class="small" id="meta">-</div>
 
       <div id="log"></div>
     </div>
