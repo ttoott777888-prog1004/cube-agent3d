@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cube-agent3d"
+version = "0.1.0"
+description = "Local server-authoritative 3D cube scene agent engine (Three.js + Python) with action logging."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name="Your Name"}]
+dependencies = [
+  "aiohttp>=3.9.0",
+]
+
+[project.scripts]
+cube-agent3d = "cube_agent3d.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.package-data]
+cube_agent3d = ["web/*.html", "web/*.js", "web/*.css"]
