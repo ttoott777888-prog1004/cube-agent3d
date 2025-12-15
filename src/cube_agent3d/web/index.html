@@ -1,15 +1,13 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="ko">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>cube-agent3d</title>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Cube Agent 3D</title>
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
   <div id="wrap">
-    <canvas id="canvas"></canvas>
-
     <div id="hud">
       <h1>Cube Agent 3D</h1>
 
@@ -23,14 +21,15 @@
       <div class="row small">
         <div id="status">연결 대기</div>
       </div>
-      <div class="row small">
-        <div id="meta">-</div>
-      </div>
+      <div class="small" id="meta"></div>
 
       <div id="log"></div>
     </div>
+
+    <canvas id="canvas"></canvas>
   </div>
 
+  <!-- 반드시 type="module" -->
   <script type="module" src="/app.js"></script>
 </body>
 </html>
