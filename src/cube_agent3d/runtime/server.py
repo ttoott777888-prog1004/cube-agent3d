@@ -32,27 +32,43 @@ class Engine:
         self.rng = random.Random(cfg.seed)
         self.state = SceneState(bounds=self.bounds, max_cubes=cfg.max_cubes, rng=self.rng)
 
-        # 정책(탐색/확장 + 자동 리셋)
-        self.policy = EnginePolicy()
-        self.policy.seed(cfg.seed)
+        self.policy = EnginePolicy(self.rng)
 
         self.running = False
         self.ws_clients: set[web.WebSocketResponse] = set()
         self.logger = SessionLogger.create(cfg.session_root)
+
+        # 에피소드: 256에서 시작 → 리셋마다 +1 → 최대 max_cubes(권장: 2000)
+        self.episode_index = 0
+        self.episode_cap = min(256, cfg.max_cubes)
+        self.episode_cap_max = cfg.max_cubes
+
         self.state.reset()
 
     async def close(self) -> None:
         self.logger.close()
 
+    def cube_count(self) -> int:
+        cubes = getattr(self.state, "cubes", [])
+        if isinstance(cubes, dict):
+            return len(cubes)
+        try:
+            return len(cubes)
+        except Exception:
+            return 0
+
     def status_payload(self) -> dict[str, Any]:
         return {
             "running": self.running,
-            "tick": self.state.tick,
-            "cube_count": len(self.state.cubes),
+            "tick": getattr(self.state, "tick", 0),
+            "cube_count": self.cube_count(),
             "session_id": self.logger.session_id,
             "session_dir": str(self.logger.session_dir),
             "tick_hz": self.cfg.tick_hz,
             "max_cubes": self.cfg.max_cubes,
+            "episode": self.episode_index,
+            "episode_cap": self.episode_cap,
+            "episode_cap_max": self.episode_cap_max,
         }
 
     async def broadcast(self, msg_type: str, payload: dict[str, Any]) -> None:
@@ -66,63 +82,121 @@ class Engine:
         for ws in dead:
             self.ws_clients.discard(ws)
 
+    def _make_snapshot(self) -> dict[str, Any]:
+        snap = self.state.snapshot()
+        snap["probes"] = self.policy.probes()
+        snap["episode"] = self.episode_index
+        snap["episode_cap"] = self.episode_cap
+        snap["episode_cap_max"] = self.episode_cap_max
+        return snap
+
+    async def _do_episode_reset(self, reason: str, *, keep_running: bool) -> None:
+        # 리셋 이벤트도 “저장”
+        score = 0.0
+        try:
+            score = float(self.state.score_tower())
+        except Exception:
+            score = 0.0
+
+        self.logger.write_summary({
+            "tick": getattr(self.state, "tick", 0),
+            "cube_count": self.cube_count(),
+            "score": score,
+            "note": "episode_reset",
+            "reason": reason,
+            "episode": self.episode_index,
+            "episode_cap": self.episode_cap,
+        })
+
+        # episode_cap 증가(최대 max_cubes)
+        if self.episode_cap < self.episode_cap_max:
+            self.episode_cap = min(self.episode_cap + 1, self.episode_cap_max)
+
+        self.episode_index += 1
+
+        # 상태 리셋
+        self.state.reset()
+        self.policy.on_episode_reset()
+
+        if not keep_running:
+            self.running = False
+
+        snap = self._make_snapshot()
+        await self.broadcast("SERVER_STATUS", self.status_payload())
+        await self.broadcast("STATE_SNAPSHOT", snap)
+
     async def engine_loop(self) -> None:
         ticker = Ticker(self.cfg.tick_hz)
         t = time.perf_counter()
 
         while True:
             if self.running:
-                actions = self.policy.decide(self.state)
-                applied, did_reset = self.apply_actions(actions)
+                # cap 도달 시: 자동 리셋(중요: “생성”의 다음 단계로 넘어가기)
+                if self.cube_count() >= self.episode_cap:
+                    await self._do_episode_reset("cap_reached", keep_running=True)
+                    t = await ticker.sleep_next(t)
+                    continue
 
-                # 점수는 UI 정보용(기존 tower_score를 유지)
-                score = 0.0 if did_reset else self.state.score_tower()
+                actions = self.policy.decide(self.state, episode_cap=self.episode_cap, max_cubes=self.cfg.max_cubes)
 
-                # 로깅
-                self.logger.write_actions({
-                    "tick": self.state.tick,
-                    "actions": applied,
-                })
+                # 정책이 “이상” 판단 시 자동 리셋
+                if actions and actions[0].get("type") == "EPISODE_RESET":
+                    await self._do_episode_reset(str(actions[0].get("reason", "policy_reset")), keep_running=True)
+                    t = await ticker.sleep_next(t)
+                    continue
+
+                applied = self.apply_actions(actions)
+
+                # 간단 학습 업데이트
+                try:
+                    self.policy.observe(applied)
+                except Exception:
+                    pass
+
+                score = 0.0
+                try:
+                    score = float(self.state.score_tower())
+                except Exception:
+                    score = 0.0
+
+                self.logger.write_actions({"tick": getattr(self.state, "tick", 0), "actions": applied})
                 self.logger.write_summary({
-                    "tick": self.state.tick,
-                    "cube_count": len(self.state.cubes),
+                    "tick": getattr(self.state, "tick", 0),
+                    "cube_count": self.cube_count(),
                     "score": score,
-                    "note": "engine_policy" if not did_reset else "engine_policy:auto_reset",
+                    "note": "engine_policy",
+                    "episode": self.episode_index,
+                    "episode_cap": self.episode_cap,
                 })
-                self.logger.write_snapshot(self.state.snapshot())
 
-                # 브로드캐스트
-                await self.broadcast("ACTION_BATCH", {"tick": self.state.tick, "actions": applied, "score": score})
-                await self.broadcast("STATE_SNAPSHOT", self.state.snapshot())
+                snap = self._make_snapshot()
+                self.logger.write_snapshot(snap)
 
-                # AUTO_RESET이면 tick 증가/age 증가를 하지 않음 (reset 상태 유지)
-                if not did_reset:
+                await self.broadcast("ACTION_BATCH", {"tick": getattr(self.state, "tick", 0), "actions": applied, "score": score})
+                await self.broadcast("STATE_SNAPSHOT", snap)
+                await self.broadcast("SERVER_STATUS", self.status_payload())
+
+                # tick 진행
+                try:
                     self.state.step_age()
-                    self.state.tick += 1
+                except Exception:
+                    pass
+                self.state.tick = getattr(self.state, "tick", 0) + 1
+
             else:
                 await self.broadcast("SERVER_STATUS", self.status_payload())
 
             t = await ticker.sleep_next(t)
 
-    def apply_actions(self, actions: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
+    def apply_actions(self, actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
         applied: list[dict[str, Any]] = []
-        did_reset = False
+        max_actions = 32
 
-        max_actions = 24
         for a in actions[:max_actions]:
             t = a.get("type")
             ok = False
 
-            if t == "AUTO_RESET":
-                self.state.reset()
-                did_reset = True
-                ok = True
-
-            elif t == "HINT_TARGET":
-                # UI 전용 힌트(상태에는 적용하지 않음)
-                ok = True
-
-            elif t == "DUPLICATE":
+            if t == "DUPLICATE":
                 ok = self.state.duplicate_cube(
                     source_id=str(a["source_id"]),
                     new_id=str(a["new_id"]),
@@ -152,7 +226,7 @@ class Engine:
             if ok:
                 applied.append(a)
 
-        return applied, did_reset
+        return applied
 
 
 async def run_server(host: str, port: int, tick_hz: float, max_cubes: int, seed: int, session_root: str) -> None:
@@ -164,7 +238,6 @@ async def run_server(host: str, port: int, tick_hz: float, max_cubes: int, seed:
     async def _serve_pkg_file(pkg_rel: str, content_type: str, *, charset: str | None = None) -> web.Response:
         with resources.files("cube_agent3d.web").joinpath(pkg_rel).open("rb") as f:
             data = f.read()
-        # aiohttp: charset는 content_type 문자열에 포함하면 안 됨 (별도 인자)
         if charset is not None:
             return web.Response(body=data, content_type=content_type, charset=charset)
         return web.Response(body=data, content_type=content_type)
@@ -184,7 +257,7 @@ async def run_server(host: str, port: int, tick_hz: float, max_cubes: int, seed:
         engine.ws_clients.add(ws)
 
         await ws.send_str(json.dumps({"type": "SERVER_STATUS", "payload": engine.status_payload()}, ensure_ascii=False))
-        await ws.send_str(json.dumps({"type": "STATE_SNAPSHOT", "payload": engine.state.snapshot()}, ensure_ascii=False))
+        await ws.send_str(json.dumps({"type": "STATE_SNAPSHOT", "payload": engine._make_snapshot()}, ensure_ascii=False))
 
         async for msg in ws:
             if msg.type == WSMsgType.TEXT:
@@ -196,20 +269,15 @@ async def run_server(host: str, port: int, tick_hz: float, max_cubes: int, seed:
                 mtype = data.get("type")
                 if mtype == "HELLO":
                     await ws.send_str(json.dumps({"type": "SERVER_STATUS", "payload": engine.status_payload()}, ensure_ascii=False))
-
                 elif mtype == "UI_START":
                     engine.running = True
                     await engine.broadcast("SERVER_STATUS", engine.status_payload())
-
                 elif mtype == "UI_STOP":
                     engine.running = False
                     await engine.broadcast("SERVER_STATUS", engine.status_payload())
-
                 elif mtype == "RESET":
-                    engine.running = False
-                    engine.state.reset()
-                    await engine.broadcast("SERVER_STATUS", engine.status_payload())
-                    await engine.broadcast("STATE_SNAPSHOT", engine.state.snapshot())
+                    # 수동 RESET: “학습/에피소드 진행”은 유지하고 상태만 리셋(원하시면 keep_running=True로 바꾸시면 됩니다)
+                    await engine._do_episode_reset("manual_reset", keep_running=False)
 
             elif msg.type == WSMsgType.ERROR:
                 break
