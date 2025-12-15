@@ -10,23 +10,52 @@ const elStatus = document.getElementById("status");
 const elMeta = document.getElementById("meta");
 const elLog = document.getElementById("log");
 
-function logLine(s) {
-  const t = new Date().toLocaleTimeString();
-  elLog.innerText = `[${t}] ${s}\n` + elLog.innerText;
+if (!elCanvas) {
+  throw new Error("canvas 요소(#canvas)를 찾을 수 없습니다. index.html을 확인하세요.");
 }
 
-function hexToThreeColor(hex) {
-  return new THREE.Color(hex);
+const LOG_MAX_LINES = 220;
+const logBuf = [];
+
+function logLine(s) {
+  if (!elLog) return;
+  const t = new Date().toLocaleTimeString();
+  logBuf.unshift(`[${t}] ${s}`);
+  if (logBuf.length > LOG_MAX_LINES) logBuf.length = LOG_MAX_LINES;
+  elLog.innerText = logBuf.join("\n");
+}
+
+function setStatusText(s) {
+  if (elStatus) elStatus.innerText = s;
+}
+
+function setMetaText(s) {
+  if (elMeta) elMeta.innerText = s;
+}
+
+function parseColor(c) {
+  // c: "#rrggbb" | "rgb(...)" | [r,g,b] (0~1 or 0~255)
+  try {
+    if (Array.isArray(c) && c.length >= 3) {
+      const r = c[0] > 1 ? c[0] / 255 : c[0];
+      const g = c[1] > 1 ? c[1] / 255 : c[1];
+      const b = c[2] > 1 ? c[2] / 255 : c[2];
+      return new THREE.Color(r, g, b);
+    }
+    if (typeof c === "string" && c.trim().length > 0) {
+      return new THREE.Color(c);
+    }
+  } catch {}
+  return new THREE.Color("#7dd3fc");
 }
 
 let ws = null;
-let lastStatus = null;
-let lastTick = 0;
-let lastScore = 0;
+let reconnectTimer = null;
+let reconnectDelayMs = 600;
 
 // --- Three.js scene
-const renderer = new THREE.WebGLRenderer({ canvas: elCanvas, antialias: true });
-renderer.setPixelRatio(window.devicePixelRatio || 1);
+const renderer = new THREE.WebGLRenderer({ canvas: elCanvas, antialias: true, alpha: false });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0b0f17);
@@ -41,14 +70,15 @@ controls.minDistance = 3;
 controls.maxDistance = 60;
 controls.target.set(0, 4, 0);
 
-elZoomReset.addEventListener("click", () => {
-  camera.position.set(8, 8, 10);
-  controls.target.set(0, 4, 0);
-  controls.update();
-});
+if (elZoomReset) {
+  elZoomReset.addEventListener("click", () => {
+    camera.position.set(8, 8, 10);
+    controls.target.set(0, 4, 0);
+    controls.update();
+  });
+}
 
-const amb = new THREE.AmbientLight(0xffffff, 0.55);
-scene.add(amb);
+scene.add(new THREE.AmbientLight(0xffffff, 0.55));
 
 const dir = new THREE.DirectionalLight(0xffffff, 1.0);
 dir.position.set(10, 20, 10);
@@ -58,16 +88,26 @@ const grid = new THREE.GridHelper(40, 40, 0x223044, 0x121a27);
 grid.position.y = 0;
 scene.add(grid);
 
-// Instanced cubes
-const MAX_INST = 256;
-const geom = new THREE.BoxGeometry(1, 1, 1);
-const mat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.65, metalness: 0.1 });
-let inst = new THREE.InstancedMesh(geom, mat, MAX_INST);
-inst.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-inst.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(MAX_INST * 3), 3);
-scene.add(inst);
+const axes = new THREE.AxesHelper(3);
+axes.position.set(0, 0.01, 0);
+scene.add(axes);
 
-let currentCount = 0;
+// Instanced cubes
+const MAX_INST = 512;
+const geom = new THREE.BoxGeometry(1, 1, 1);
+const mat = new THREE.MeshStandardMaterial({
+  vertexColors: true,
+  roughness: 0.65,
+  metalness: 0.1,
+});
+
+const inst = new THREE.InstancedMesh(geom, mat, MAX_INST);
+inst.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+// 색상 버퍼를 미리 준비 (setColorAt 사용)
+inst.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(MAX_INST * 3), 3);
+inst.instanceColor.setUsage(THREE.DynamicDrawUsage);
+
+scene.add(inst);
 
 const _m = new THREE.Matrix4();
 const _p = new THREE.Vector3();
@@ -75,106 +115,148 @@ const _q = new THREE.Quaternion();
 const _s = new THREE.Vector3();
 
 function applySnapshot(payload) {
-  const cubes = payload.cubes || [];
-  lastTick = payload.tick || 0;
+  const cubes = payload?.cubes || [];
+  const tick = payload?.tick ?? 0;
 
-  currentCount = Math.min(cubes.length, MAX_INST);
+  const count = Math.min(cubes.length, MAX_INST);
+  inst.count = count;
 
-  for (let i = 0; i < currentCount; i++) {
+  for (let i = 0; i < count; i++) {
     const c = cubes[i];
 
-    _p.set(c.pos[0], c.pos[1], c.pos[2]);
-    _q.set(c.rot[0], c.rot[1], c.rot[2], c.rot[3]);
-    _s.set(c.scale[0], c.scale[1], c.scale[2]);
+    const pos = c?.pos || [0, 0, 0];
+    const rot = c?.rot || [0, 0, 0, 1];
+    const sca = c?.scale || [1, 1, 1];
+
+    _p.set(pos[0] || 0, pos[1] || 0, pos[2] || 0);
+    _q.set(rot[0] || 0, rot[1] || 0, rot[2] || 0, rot[3] ?? 1);
+    _s.set(sca[0] || 1, sca[1] || 1, sca[2] || 1);
 
     _m.compose(_p, _q, _s);
     inst.setMatrixAt(i, _m);
 
-    const col = hexToThreeColor(c.color || "#7dd3fc");
-    inst.setColorAt(i, col);
-  }
-
-  for (let i = currentCount; i < MAX_INST; i++) {
-    _m.identity();
-    _m.makeScale(0, 0, 0);
-    inst.setMatrixAt(i, _m);
+    inst.setColorAt(i, parseColor(c?.color));
   }
 
   inst.instanceMatrix.needsUpdate = true;
   if (inst.instanceColor) inst.instanceColor.needsUpdate = true;
+
+  // 서버 상태 텍스트가 STOP일 때도 tick 표시가 갱신되도록 보조
+  // (서버에서 STOP 중에는 STATUS만 보내는 구조일 수 있어서)
+  if (tick !== undefined && elStatus && elStatus.innerText.includes("STOP")) {
+    // 유지: 필요 시만 표시가 자연스럽게 따라오도록
+  }
+}
+
+function setButtonsEnabled(connected) {
+  if (elStart) elStart.disabled = !connected;
+  if (elStop) elStop.disabled = !connected;
+  if (elReset) elReset.disabled = !connected;
+  if (elZoomReset) elZoomReset.disabled = !connected;
 }
 
 function connectWS() {
-  const proto = (location.protocol === "https:") ? "wss" : "ws";
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+
+  const proto = location.protocol === "https:" ? "wss" : "ws";
   const url = `${proto}://${location.host}/ws`;
-  ws = new WebSocket(url);
+
+  try {
+    ws = new WebSocket(url);
+  } catch (e) {
+    setStatusText("오류");
+    logLine(`WebSocket 생성 실패: ${String(e)}`);
+    scheduleReconnect();
+    return;
+  }
 
   ws.onopen = () => {
-    elStatus.innerText = "연결됨";
-    ws.send(JSON.stringify({ type: "HELLO", payload: { client: "web" } }));
+    reconnectDelayMs = 600;
+    setButtonsEnabled(true);
+    setStatusText("연결됨");
     logLine("WebSocket 연결됨");
+    ws.send(JSON.stringify({ type: "HELLO", payload: { client: "web" } }));
   };
 
   ws.onclose = () => {
-    elStatus.innerText = "연결 끊김";
+    setButtonsEnabled(false);
+    setStatusText("연결 끊김");
     logLine("WebSocket 연결 끊김");
-    setTimeout(connectWS, 800);
+    scheduleReconnect();
   };
 
   ws.onerror = () => {
-    elStatus.innerText = "오류";
+    setStatusText("오류");
   };
 
   ws.onmessage = (ev) => {
-    let msg = null;
-    try { msg = JSON.parse(ev.data); } catch { return; }
+    let msg;
+    try {
+      msg = JSON.parse(ev.data);
+    } catch {
+      return;
+    }
 
-    const type = msg.type;
-    const payload = msg.payload || {};
+    const type = msg?.type;
+    const payload = msg?.payload || {};
 
     if (type === "SERVER_STATUS") {
-      lastStatus = payload;
       const run = payload.running ? "RUN" : "STOP";
-      elStatus.innerText = `${run} | tick=${payload.tick} | cubes=${payload.cube_count}`;
-      elMeta.innerText = `session=${payload.session_id} | tick_hz=${payload.tick_hz} | max_cubes=${payload.max_cubes}`;
-    }
-
-    if (type === "STATE_SNAPSHOT") {
+      setStatusText(`${run} | tick=${payload.tick} | cubes=${payload.cube_count}`);
+      setMetaText(`session=${payload.session_id} | tick_hz=${payload.tick_hz} | max_cubes=${payload.max_cubes}`);
+    } else if (type === "STATE_SNAPSHOT") {
       applySnapshot(payload);
-    }
-
-    if (type === "ACTION_BATCH") {
-      lastScore = payload.score || 0;
+    } else if (type === "ACTION_BATCH") {
+      const score = payload.score ?? 0;
       const actions = payload.actions || [];
       if (actions.length > 0) {
         const head = actions[0];
-        logLine(`tick=${payload.tick} score=${lastScore.toFixed(2)} actions=${actions.length} head=${head.type}`);
+        logLine(`tick=${payload.tick} score=${Number(score).toFixed(2)} actions=${actions.length} head=${head.type}`);
       } else {
-        logLine(`tick=${payload.tick} score=${lastScore.toFixed(2)} actions=0`);
+        logLine(`tick=${payload.tick} score=${Number(score).toFixed(2)} actions=0`);
       }
     }
   };
 }
 
-elStart.addEventListener("click", () => {
-  if (!ws || ws.readyState !== 1) return;
-  ws.send(JSON.stringify({ type: "UI_START", payload: {} }));
-});
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    reconnectDelayMs = Math.min(Math.floor(reconnectDelayMs * 1.4), 5000);
+    connectWS();
+  }, reconnectDelayMs);
+}
 
-elStop.addEventListener("click", () => {
-  if (!ws || ws.readyState !== 1) return;
-  ws.send(JSON.stringify({ type: "UI_STOP", payload: {} }));
-});
+if (elStart) {
+  elStart.addEventListener("click", () => {
+    if (!ws || ws.readyState !== 1) return;
+    ws.send(JSON.stringify({ type: "UI_START", payload: {} }));
+  });
+}
 
-elReset.addEventListener("click", () => {
-  if (!ws || ws.readyState !== 1) return;
-  ws.send(JSON.stringify({ type: "RESET", payload: {} }));
-  logLine("RESET 요청");
-});
+if (elStop) {
+  elStop.addEventListener("click", () => {
+    if (!ws || ws.readyState !== 1) return;
+    ws.send(JSON.stringify({ type: "UI_STOP", payload: {} }));
+  });
+}
+
+if (elReset) {
+  elReset.addEventListener("click", () => {
+    if (!ws || ws.readyState !== 1) return;
+    ws.send(JSON.stringify({ type: "RESET", payload: {} }));
+    logLine("RESET 요청");
+  });
+}
 
 function resize() {
-  const w = window.innerWidth;
-  const h = window.innerHeight;
+  const rect = elCanvas.getBoundingClientRect();
+  const w = Math.max(1, Math.floor(rect.width));
+  const h = Math.max(1, Math.floor(rect.height));
   renderer.setSize(w, h, false);
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
@@ -189,4 +271,5 @@ function animate() {
 }
 animate();
 
+setButtonsEnabled(false);
 connectWS();
