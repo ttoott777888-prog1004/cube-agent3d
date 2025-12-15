@@ -1,386 +1,284 @@
 from __future__ import annotations
 
-import asyncio
-import json
+import math
 import random
-import time
+from collections import deque
 from dataclasses import dataclass
-from importlib import resources
-from typing import Any, Iterable, Tuple
+from typing import Any
 
-from aiohttp import web, WSMsgType
-
-from ..protocol.types import Bounds
 from ..scene.state import SceneState
-from ..storage.logger import SessionLogger
-from ..runtime.tick import Ticker
 
 
 @dataclass
-class EngineConfig:
-    tick_hz: float
-    max_cubes: int
-    seed: int
-    session_root: str
-
-
-def _iter_cubes(state: SceneState) -> list[Any]:
-    cubes = getattr(state, "cubes", [])
-    if isinstance(cubes, dict):
-        return list(cubes.values())
-    if isinstance(cubes, (list, tuple)):
-        return list(cubes)
-    try:
-        return list(cubes)  # type: ignore[arg-type]
-    except Exception:
-        return []
-
-
-def _cube_id(c: Any) -> str:
-    if isinstance(c, dict):
-        return str(c.get("id", ""))
-    return str(getattr(c, "id", ""))
-
-
-def _cube_pos(c: Any) -> Tuple[int, int, int]:
-    if isinstance(c, dict):
-        p = c.get("pos", [0, 0, 0])
-    else:
-        p = getattr(c, "pos", [0, 0, 0])
-    x, y, z = (p[0], p[1], p[2]) if isinstance(p, (list, tuple)) and len(p) >= 3 else (0, 0, 0)
-    return int(round(float(x))), int(round(float(y))), int(round(float(z)))
-
-
-class ExplorerPolicy:
+class EnginePolicy:
     """
-    - 26방향(3x3x3-1) 후보 위치를 만들고
-    - y<0(바닥 밑) 금지
-    - 충돌(이미 점유) 금지
-    - y>0이면 아래 지지(support) 있는 곳을 선호
-    - 후보를 probes로 제공(프론트에서 초록 반투명 표시)
+    탐색/확장 정책:
+    - 3D 공간에서 (x,z) 전방위 + (y) 높이까지 목표(target)를 스스로 선택
+    - 목표 위치는 UI에서 '초록색 투명 상자'로 시각화 가능 (HINT_TARGET 액션)
+    - 바닥 아래(y<0)는 금지. (추가로 큐브 스케일을 고려해 중심 y를 보정)
+    - 일정 시간 동안 '위로만' 가거나 정체(stuck)로 판단되면 AUTO_RESET으로 상태 리셋
     """
+    # 행동 제약
+    max_actions_per_tick: int = 24
+    max_spawn_per_tick: int = 1
 
-    def __init__(self, rng: random.Random, *, probe_n: int = 24) -> None:
-        self.rng = rng
-        self.probe_n = probe_n
-        self._last_probes: list[dict[str, Any]] = []
-        self._visited: set[Tuple[int, int, int]] = set()
+    # 이동/탐색 파라미터
+    step_len: float = 0.55
+    target_hold_ticks: int = 18
+    target_reach_eps: float = 0.85
 
-    def probes(self) -> list[dict[str, Any]]:
-        return self._last_probes
+    # 리셋(자기점검) 파라미터
+    stuck_window: int = 64
+    stuck_move_eps: float = 0.03
+    up_only_dzdx_eps: float = 0.05
+    up_only_dy_min: float = 0.08
+    reset_cooldown: int = 60
 
-    def decide(self, state: SceneState, *, max_cubes: int) -> list[dict[str, Any]]:
-        cubes = _iter_cubes(state)
+    def __post_init__(self) -> None:
+        self.rng = random.Random()
+        self._target: list[float] | None = None
+        self._target_tick: int = 0
+        self._visited: list[tuple[float, float, float]] = []
+        self._move_hist: deque[tuple[float, float, float]] = deque(maxlen=self.stuck_window)
+        self._since_reset: int = 10_000
+
+    def seed(self, seed: int) -> None:
+        self.rng.seed(seed)
+
+    def decide(self, st: SceneState) -> list[dict[str, Any]]:
+        actions: list[dict[str, Any]] = []
+
+        # 내부 카운터
+        self._since_reset += 1
+
+        cubes = list(st.cubes.values())
         if not cubes:
-            self._last_probes = []
-            return []
+            return actions
 
-        occ: set[Tuple[int, int, int]] = set(_cube_pos(c) for c in cubes)
-
-        # frontier(확장 여지 많은 큐브) 선택
-        def frontier_score(c: Any) -> int:
-            x, y, z = _cube_pos(c)
-            score = 0
-            for dx in (-1, 0, 1):
-                for dy in (-1, 0, 1):
-                    for dz in (-1, 0, 1):
-                        if dx == dy == dz == 0:
-                            continue
-                        nx, ny, nz = x + dx, y + dy, z + dz
-                        if ny < 0:
-                            continue
-                        if (nx, ny, nz) in occ:
-                            continue
-                        # y>0이면 아래 지지 체크(없어도 후보로는 보여주되 점수 낮춤)
-                        score += 1
-            return score
-
-        best = max(cubes, key=frontier_score)
-        head_id = _cube_id(best)
-        hx, hy, hz = _cube_pos(best)
-
-        # Bounds가 있으면 최대한 존중(없으면 넉넉한 기본값)
-        b = getattr(state, "bounds", Bounds())
-        x_min = int(getattr(b, "x_min", -40))
-        x_max = int(getattr(b, "x_max", 40))
-        y_min = int(getattr(b, "y_min", 0))
-        y_max = int(getattr(b, "y_max", 80))
-        z_min = int(getattr(b, "z_min", -40))
-        z_max = int(getattr(b, "z_max", 40))
-
-        cand: list[Tuple[float, Tuple[int, int, int], Tuple[int, int, int]]] = []
-        for dx in (-1, 0, 1):
-            for dy in (-1, 0, 1):
-                for dz in (-1, 0, 1):
-                    if dx == dy == dz == 0:
-                        continue
-                    nx, ny, nz = hx + dx, hy + dy, hz + dz
-
-                    if ny < 0:
-                        continue
-                    if nx < x_min or nx > x_max or nz < z_min or nz > z_max:
-                        continue
-                    if ny < y_min or ny > y_max:
-                        continue
-                    if (nx, ny, nz) in occ:
-                        continue
-
-                    support = 1 if ny == 0 else (1 if (nx, ny - 1, nz) in occ else 0)
-                    novelty = 1 if (nx, ny, nz) not in self._visited else 0
-
-                    # 전방위로 퍼지게: 원점으로부터 거리(너무 과하면 bounds에 막힘)
-                    spread = (abs(nx) + abs(nz)) * 0.10
-                    height = ny * 0.05
-
-                    # 점수(고정된 한 방향으로만 못 가게 랜덤 미세 노이즈 포함)
-                    score = (support * 5.0) + (novelty * 2.0) + spread + height + (self.rng.random() * 0.01)
-
-                    # 아래 지지 없는 공중 후보도 “보이긴 하게” 하되 선택은 거의 안 되게
-                    if ny > 0 and support == 0:
-                        score -= 10.0
-
-                    cand.append((score, (nx, ny, nz), (dx, dy, dz)))
-
-        cand.sort(key=lambda t: t[0], reverse=True)
-
-        # probes(초록 반투명 표시용): 상위 N개
-        probes: list[dict[str, Any]] = []
-        for i, (_, (px, py, pz), _) in enumerate(cand[: self.probe_n]):
-            probes.append({
-                "pos": [px, py, pz],
-                "scale": [1.02, 1.02, 1.02],
-            })
-        self._last_probes = probes
-
-        if not cand:
-            return []
-
-        # 최종 선택: 상위 몇 개 중 하나를 랜덤(완전 결정적이면 또 한쪽으로 굳음)
-        top_k = min(6, len(cand))
-        pick = cand[self.rng.randrange(0, top_k)]
-        _, (tx, ty, tz), (dx, dy, dz) = pick
-
-        # MOVE vs DUPLICATE: max_cubes 도달 전에는 DUPLICATE 우선
-        cube_count = len(getattr(state, "cubes", [])) if not isinstance(getattr(state, "cubes", []), dict) else len(getattr(state, "cubes", {}).keys())
-        can_dup = cube_count < max_cubes
-
-        if can_dup and self.rng.random() < 0.75:
-            new_id = f"c{getattr(state, 'tick', 0)}_{self.rng.randrange(1_000_000)}"
-            self._visited.add((tx, ty, tz))
+        # ---- 자동 리셋 판단
+        if self._should_auto_reset(st):
+            self._since_reset = 0
+            self._move_hist.clear()
+            self._target = None
+            self._visited.clear()
             return [{
-                "type": "DUPLICATE",
-                "source_id": head_id,
-                "new_id": new_id,
-                "offset": [dx, dy, dz],
+                "type": "AUTO_RESET",
+                "reason": "stuck_or_up_only",
             }]
 
-        self._visited.add((tx, ty, tz))
-        return [{
+        # ---- 타겟 갱신
+        if self._target is None or (st.tick - self._target_tick) >= self.target_hold_ticks:
+            self._target = self._pick_target(st)
+            self._target_tick = st.tick
+
+        # 현재 기준 큐브(조작 대상) 선택: 최근 생성된 큐브를 우선
+        selected = self._pick_active_cube(st)
+
+        # 타겟 도달 시 타겟 재생성
+        if self._dist3(selected.pos, self._target) <= self.target_reach_eps:
+            self._visited.append(tuple(self._target))
+            self._target = self._pick_target(st)
+            self._target_tick = st.tick
+
+        # ---- UI 힌트(초록 투명 타겟)
+        actions.append({
+            "type": "HINT_TARGET",
+            "pos": [float(self._target[0]), float(self._target[1]), float(self._target[2])],
+            "scale": [1.02, 1.02, 1.02],
+            "color": "#00ff66",
+            "alpha": 0.20,
+        })
+
+        # ---- 복제(확장)
+        spawned_id: str | None = None
+        if len(st.cubes) < st.max_cubes and self.rng.random() < 0.28:
+            dx, dy, dz = self._dir_step(selected.pos, self._target, step=1.05)
+            new_id = st.next_id()
+            actions.append({
+                "type": "DUPLICATE",
+                "source_id": selected.id,
+                "new_id": new_id,
+                "offset": [dx, max(0.0, dy), dz],
+            })
+            spawned_id = new_id
+
+        # ---- 이동(전방위)
+        move_id = spawned_id if spawned_id is not None else selected.id
+        cur = st.cubes.get(move_id, selected)
+        nx, ny, nz = self._step_toward(st, cur.pos, cur.scale, self._target, self.step_len)
+        actions.append({
             "type": "MOVE",
-            "id": head_id,
-            "pos": [tx, ty, tz],
-        }]
+            "id": move_id,
+            "pos": [nx, ny, nz],
+        })
 
+        # 이동 히스토리(자기점검)
+        self._move_hist.append((nx - cur.pos[0], ny - cur.pos[1], nz - cur.pos[2]))
 
-class Engine:
-    def __init__(self, cfg: EngineConfig) -> None:
-        self.cfg = cfg
-        self.bounds = Bounds()
-        self.rng = random.Random(cfg.seed)
-        self.state = SceneState(bounds=self.bounds, max_cubes=cfg.max_cubes, rng=self.rng)
+        # ---- 회전/스케일/색상 (가벼운 다양화)
+        if self.rng.random() < 0.9:
+            yaw = (st.tick * 0.07) + self.rng.uniform(-0.25, 0.25)
+            actions.append({
+                "type": "ROTATE_YAW",
+                "id": move_id,
+                "yaw": float(yaw),
+            })
 
-        self.policy = ExplorerPolicy(self.rng, probe_n=24)
+        if self.rng.random() < 0.22:
+            s = 0.85 + 0.35 * self.rng.random()
+            sy = 0.95 + 0.15 * self.rng.random()
+            actions.append({
+                "type": "SCALE",
+                "id": move_id,
+                "scale": [float(s), float(sy), float(s)],
+            })
 
-        self.running = False
-        self.ws_clients: set[web.WebSocketResponse] = set()
-        self.logger = SessionLogger.create(cfg.session_root)
-        self.state.reset()
+        if spawned_id is not None or self.rng.random() < 0.14:
+            actions.append({
+                "type": "SET_COLOR",
+                "id": move_id,
+                "color": self._rand_color(),
+            })
 
-    async def close(self) -> None:
-        self.logger.close()
+        return actions[: self.max_actions_per_tick]
 
-    def status_payload(self) -> dict[str, Any]:
-        return {
-            "running": self.running,
-            "tick": self.state.tick,
-            "cube_count": len(self.state.cubes) if not isinstance(self.state.cubes, dict) else len(self.state.cubes.keys()),
-            "session_id": self.logger.session_id,
-            "session_dir": str(self.logger.session_dir),
-            "tick_hz": self.cfg.tick_hz,
-            "max_cubes": self.cfg.max_cubes,
-        }
+    # ---------- 내부 유틸 ----------
 
-    async def broadcast(self, msg_type: str, payload: dict[str, Any]) -> None:
-        dead: list[web.WebSocketResponse] = []
-        data = json.dumps({"type": msg_type, "payload": payload}, ensure_ascii=False)
-        for ws in list(self.ws_clients):
+    def _pick_active_cube(self, st: SceneState):
+        best = None
+        best_int = -1
+        for k, v in st.cubes.items():
             try:
-                await ws.send_str(data)
+                i = int(k)
             except Exception:
-                dead.append(ws)
-        for ws in dead:
-            self.ws_clients.discard(ws)
+                i = -1
+            if i > best_int:
+                best_int = i
+                best = v
+        if best is not None:
+            return best
+        return self.rng.choice(list(st.cubes.values()))
 
-    async def engine_loop(self) -> None:
-        ticker = Ticker(self.cfg.tick_hz)
-        t = time.perf_counter()
+    def _pick_target(self, st: SceneState) -> list[float]:
+        b = st.bounds
 
-        while True:
-            if self.running:
-                actions = self.policy.decide(self.state, max_cubes=self.cfg.max_cubes)
-                applied = self.apply_actions(actions)
+        best: list[float] | None = None
+        best_score = -1e18
 
-                score = self.state.score_tower()
+        pad = 1.2
+        xmin, xmax = b.x_min + pad, b.x_max - pad
+        zmin, zmax = b.z_min + pad, b.z_max - pad
+        ymin = max(b.y_min + 0.55, 0.55)
+        ymax = max(ymin + 0.1, min(b.y_max - 0.55, b.y_max * 0.65))
 
-                self.logger.write_actions({"tick": self.state.tick, "actions": applied})
-                self.logger.write_summary({
-                    "tick": self.state.tick,
-                    "cube_count": len(self.state.cubes) if not isinstance(self.state.cubes, dict) else len(self.state.cubes.keys()),
-                    "score": score,
-                    "note": "explorer_policy",
-                })
+        cubes = list(st.cubes.values())
 
-                snap = self.state.snapshot()
-                snap["probes"] = self.policy.probes()  # <-- 초록 반투명 탐색 후보
-                self.logger.write_snapshot(snap)
+        for _ in range(18):
+            x = self.rng.uniform(xmin, xmax)
+            z = self.rng.uniform(zmin, zmax)
+            y = self.rng.triangular(ymin, ymax, ymin + (ymax - ymin) * 0.35)
 
-                await self.broadcast("ACTION_BATCH", {"tick": self.state.tick, "actions": applied, "score": score})
-                await self.broadcast("STATE_SNAPSHOT", snap)
-                await self.broadcast("SERVER_STATUS", self.status_payload())
+            cand = [x, y, z]
 
-                self.state.step_age()
-                self.state.tick += 1
+            if self._visited:
+                dv = min(self._dist3(cand, list(v)) for v in self._visited[-120:])
             else:
-                await self.broadcast("SERVER_STATUS", self.status_payload())
+                dv = 5.0
 
-            t = await ticker.sleep_next(t)
+            if cubes:
+                dc = min(self._dist3(cand, c.pos) for c in cubes)
+            else:
+                dc = 5.0
 
-    def apply_actions(self, actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        applied: list[dict[str, Any]] = []
-        max_actions = 24
+            py = max(0.0, (y - (ymin + ymax) * 0.5)) * 0.35
 
-        for a in actions[:max_actions]:
-            t = a.get("type")
-            ok = False
+            score = (dv * 0.75) + (dc * 0.35) - py
+            if score > best_score:
+                best_score = score
+                best = cand
 
-            if t == "DUPLICATE":
-                ok = self.state.duplicate_cube(
-                    source_id=str(a["source_id"]),
-                    new_id=str(a["new_id"]),
-                    offset=list(a["offset"]),
-                )
-            elif t == "MOVE":
-                ok = self.state.move_cube_abs(
-                    cid=str(a["id"]),
-                    pos=list(a["pos"]),
-                )
-            elif t == "ROTATE_YAW":
-                ok = self.state.rotate_cube_yaw(
-                    cid=str(a["id"]),
-                    yaw_rad=float(a["yaw"]),
-                )
-            elif t == "SCALE":
-                ok = self.state.scale_cube_abs(
-                    cid=str(a["id"]),
-                    scale=list(a["scale"]),
-                )
-            elif t == "SET_COLOR":
-                ok = self.state.set_color(
-                    cid=str(a["id"]),
-                    color=str(a["color"]),
-                )
+        if best is None:
+            best = [0.0, ymin, 0.0]
 
-            if ok:
-                applied.append(a)
+        self._visited.append(tuple(best))
+        return [float(best[0]), float(best[1]), float(best[2])]
 
-        return applied
+    def _step_toward(self, st: SceneState, pos: list[float], scale: list[float], target: list[float], step: float) -> tuple[float, float, float]:
+        dx, dy, dz = self._dir_step(pos, target, step=step)
+        nx = pos[0] + dx
+        ny = pos[1] + dy
+        nz = pos[2] + dz
 
+        sy = float(scale[1]) if scale else 1.0
+        min_center_y = max(st.bounds.y_min + 0.5 * sy, 0.5 * sy)
+        if ny < min_center_y:
+            ny = min_center_y
 
-async def run_server(host: str, port: int, tick_hz: float, max_cubes: int, seed: int, session_root: str) -> None:
-    cfg = EngineConfig(tick_hz=tick_hz, max_cubes=max_cubes, seed=seed, session_root=session_root)
-    engine = Engine(cfg)
+        nx = max(st.bounds.x_min, min(st.bounds.x_max, nx))
+        ny = max(st.bounds.y_min, min(st.bounds.y_max, ny))
+        nz = max(st.bounds.z_min, min(st.bounds.z_max, nz))
 
-    app = web.Application()
+        return float(nx), float(ny), float(nz)
 
-    async def _serve_pkg_file(pkg_rel: str, content_type: str, *, charset: str | None = None) -> web.Response:
-        with resources.files("cube_agent3d.web").joinpath(pkg_rel).open("rb") as f:
-            data = f.read()
-        if charset is not None:
-            return web.Response(body=data, content_type=content_type, charset=charset)
-        return web.Response(body=data, content_type=content_type)
+    def _dir_step(self, pos: list[float], target: list[float], step: float) -> tuple[float, float, float]:
+        vx = target[0] - pos[0]
+        vy = target[1] - pos[1]
+        vz = target[2] - pos[2]
+        d = math.sqrt(vx * vx + vy * vy + vz * vz)
+        if d <= 1e-9:
+            return 0.0, 0.0, 0.0
+        s = min(1.0, step / d)
+        return vx * s, vy * s, vz * s
 
-    async def index(request: web.Request) -> web.Response:
-        return await _serve_pkg_file("index.html", "text/html", charset="utf-8")
+    def _dist3(self, a: list[float], b: list[float]) -> float:
+        dx = a[0] - b[0]
+        dy = a[1] - b[1]
+        dz = a[2] - b[2]
+        return math.sqrt(dx * dx + dy * dy + dz * dz)
 
-    async def app_js(request: web.Request) -> web.Response:
-        return await _serve_pkg_file("app.js", "application/javascript", charset="utf-8")
+    def _should_auto_reset(self, st: SceneState) -> bool:
+        if self._since_reset < self.reset_cooldown:
+            return False
 
-    async def style_css(request: web.Request) -> web.Response:
-        return await _serve_pkg_file("style.css", "text/css", charset="utf-8")
+        if len(self._move_hist) < max(12, self.stuck_window // 3):
+            return False
 
-    async def ws_handler(request: web.Request) -> web.WebSocketResponse:
-        ws = web.WebSocketResponse(heartbeat=20)
-        await ws.prepare(request)
-        engine.ws_clients.add(ws)
+        avg_move = sum(abs(dx) + abs(dy) + abs(dz) for dx, dy, dz in self._move_hist) / max(1, len(self._move_hist))
+        if avg_move < self.stuck_move_eps:
+            return True
 
-        snap = engine.state.snapshot()
-        snap["probes"] = engine.policy.probes()
-        await ws.send_str(json.dumps({"type": "SERVER_STATUS", "payload": engine.status_payload()}, ensure_ascii=False))
-        await ws.send_str(json.dumps({"type": "STATE_SNAPSHOT", "payload": snap}, ensure_ascii=False))
+        avg_dxz = sum(abs(dx) + abs(dz) for dx, dy, dz in self._move_hist) / max(1, len(self._move_hist))
+        avg_dy = sum(dy for dx, dy, dz in self._move_hist) / max(1, len(self._move_hist))
+        if avg_dxz < self.up_only_dzdx_eps and avg_dy > self.up_only_dy_min:
+            return True
 
-        async for msg in ws:
-            if msg.type == WSMsgType.TEXT:
-                try:
-                    data = json.loads(msg.data)
-                except Exception:
-                    continue
+        return False
 
-                mtype = data.get("type")
-                if mtype == "HELLO":
-                    await ws.send_str(json.dumps({"type": "SERVER_STATUS", "payload": engine.status_payload()}, ensure_ascii=False))
-                elif mtype == "UI_START":
-                    engine.running = True
-                    await engine.broadcast("SERVER_STATUS", engine.status_payload())
-                elif mtype == "UI_STOP":
-                    engine.running = False
-                    await engine.broadcast("SERVER_STATUS", engine.status_payload())
-                elif mtype == "RESET":
-                    engine.running = False
-                    engine.state.reset()
-                    snap2 = engine.state.snapshot()
-                    snap2["probes"] = engine.policy.probes()
-                    await engine.broadcast("SERVER_STATUS", engine.status_payload())
-                    await engine.broadcast("STATE_SNAPSHOT", snap2)
-            elif msg.type == WSMsgType.ERROR:
-                break
+    def _rand_color(self) -> str:
+        h = self.rng.random()
+        s = 0.55 + 0.35 * self.rng.random()
+        v = 0.78 + 0.18 * self.rng.random()
+        r, g, b = self._hsv_to_rgb(h, s, v)
+        return f"#{r:02x}{g:02x}{b:02x}"
 
-        engine.ws_clients.discard(ws)
-        return ws
+    def _hsv_to_rgb(self, h: float, s: float, v: float) -> tuple[int, int, int]:
+        i = int(h * 6.0) % 6
+        f = (h * 6.0) - i
+        p = v * (1.0 - s)
+        q = v * (1.0 - f * s)
+        t = v * (1.0 - (1.0 - f) * s)
 
-    app.add_routes([
-        web.get("/", index),
-        web.get("/app.js", app_js),
-        web.get("/style.css", style_css),
-        web.get("/ws", ws_handler),
-    ])
+        if i == 0:
+            r, g, b = v, t, p
+        elif i == 1:
+            r, g, b = q, v, p
+        elif i == 2:
+            r, g, b = p, v, t
+        elif i == 3:
+            r, g, b = p, q, v
+        elif i == 4:
+            r, g, b = t, p, v
+        else:
+            r, g, b = v, p, q
 
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, host=host, port=port)
-
-    loop_task = asyncio.create_task(engine.engine_loop())
-
-    print(f"서버 시작: http://{host}:{port}")
-    print(f"세션: {engine.logger.session_id}  (저장 위치: {engine.logger.session_dir})")
-
-    try:
-        await site.start()
-        while True:
-            await asyncio.sleep(3600)
-    finally:
-        loop_task.cancel()
-        try:
-            await engine.close()
-        except Exception:
-            pass
-        await runner.cleanup()
+        return int(r * 255), int(g * 255), int(b * 255)

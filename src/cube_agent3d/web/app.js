@@ -1,5 +1,5 @@
-import * as THREE from "https://esm.sh/three@0.160.0";
-import { OrbitControls } from "https://esm.sh/three@0.160.0/examples/jsm/controls/OrbitControls.js";
+import * as THREE from "https://unpkg.com/three@0.160.0/build/three.module.js";
+import { OrbitControls } from "https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js";
 
 const elCanvas = document.getElementById("canvas");
 const elStart = document.getElementById("btnStart");
@@ -16,15 +16,17 @@ function logLine(s) {
 }
 
 function hexToThreeColor(hex) {
-  try { return new THREE.Color(hex); } catch { return new THREE.Color("#7dd3fc"); }
+  return new THREE.Color(hex);
 }
 
 let ws = null;
+let lastStatus = null;
+let lastTick = 0;
+let lastScore = 0;
 
 // --- Three.js scene
 const renderer = new THREE.WebGLRenderer({ canvas: elCanvas, antialias: true });
 renderer.setPixelRatio(window.devicePixelRatio || 1);
-renderer.outputColorSpace = THREE.SRGBColorSpace;
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0b0f17);
@@ -36,7 +38,7 @@ const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 controls.dampingFactor = 0.08;
 controls.minDistance = 3;
-controls.maxDistance = 80;
+controls.maxDistance = 60;
 controls.target.set(0, 4, 0);
 
 elZoomReset.addEventListener("click", () => {
@@ -45,76 +47,64 @@ elZoomReset.addEventListener("click", () => {
   controls.update();
 });
 
-scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+const amb = new THREE.AmbientLight(0xffffff, 0.55);
+scene.add(amb);
+
 const dir = new THREE.DirectionalLight(0xffffff, 1.0);
 dir.position.set(10, 20, 10);
 scene.add(dir);
 
-const grid = new THREE.GridHelper(60, 60, 0x223044, 0x121a27);
+const grid = new THREE.GridHelper(40, 40, 0x223044, 0x121a27);
 grid.position.y = 0;
 scene.add(grid);
 
-// ===== Instanced cubes (solid)
-let MAX_INST = 256;
+// --- 탐색 타겟(초록색 투명 상자)
+const targetGeom = new THREE.BoxGeometry(1, 1, 1);
+const targetMat = new THREE.MeshBasicMaterial({
+  color: 0x00ff66,
+  transparent: true,
+  opacity: 0.2,
+  depthWrite: false,
+});
+const targetMesh = new THREE.Mesh(targetGeom, targetMat);
+targetMesh.visible = false;
+scene.add(targetMesh);
 
-const cubeGeom = new THREE.BoxGeometry(1, 1, 1);
-const cubeMat = new THREE.MeshStandardMaterial({
+const targetWire = new THREE.LineSegments(
+  new THREE.EdgesGeometry(targetGeom),
+  new THREE.LineBasicMaterial({ color: 0x00ff66, transparent: true, opacity: 0.75 })
+);
+targetWire.visible = false;
+scene.add(targetWire);
+
+// Instanced cubes
+const MAX_INST = 256;
+const geom = new THREE.BoxGeometry(1, 1, 1);
+const mat = new THREE.MeshStandardMaterial({
   vertexColors: true,
   roughness: 0.65,
-  metalness: 0.1,
+  metalness: 0.1
 });
-
-let inst = new THREE.InstancedMesh(cubeGeom, cubeMat, MAX_INST);
+let inst = new THREE.InstancedMesh(geom, mat, MAX_INST);
 inst.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
 inst.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(MAX_INST * 3), 3);
 scene.add(inst);
 
 let currentCount = 0;
 
-// ===== Probes (green transparent boxes)
-const MAX_PROBES = 64;
-const probeGeom = new THREE.BoxGeometry(1.02, 1.02, 1.02);
-const probeMat = new THREE.MeshBasicMaterial({
-  vertexColors: true,
-  transparent: true,
-  opacity: 0.22,
-  depthWrite: false,
-});
-let probeInst = new THREE.InstancedMesh(probeGeom, probeMat, MAX_PROBES);
-probeInst.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-probeInst.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(MAX_PROBES * 3), 3);
-scene.add(probeInst);
-
 const _m = new THREE.Matrix4();
 const _p = new THREE.Vector3();
 const _q = new THREE.Quaternion();
-const _s = new THREE.Vector3(1, 1, 1);
+const _s = new THREE.Vector3();
 
-function ensureCapacity(n) {
-  if (n <= MAX_INST) return;
+function applySnapshot(payload) {
+  const cubes = payload.cubes || [];
+  lastTick = payload.tick || 0;
 
-  const newMax = Math.max(n, MAX_INST * 2, 256);
-  MAX_INST = newMax;
-
-  scene.remove(inst);
-  inst.dispose?.();
-
-  inst = new THREE.InstancedMesh(cubeGeom, cubeMat, MAX_INST);
-  inst.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-  inst.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(MAX_INST * 3), 3);
-  scene.add(inst);
-
-  logLine(`Instanced capacity expanded: ${MAX_INST}`);
-}
-
-function applyCubes(cubes) {
-  const arr = cubes || [];
-  ensureCapacity(arr.length);
-
-  currentCount = Math.min(arr.length, MAX_INST);
+  currentCount = Math.min(cubes.length, MAX_INST);
 
   for (let i = 0; i < currentCount; i++) {
-    const c = arr[i];
+    const c = cubes[i];
 
     _p.set(c.pos[0], c.pos[1], c.pos[2]);
     _q.set(c.rot[0], c.rot[1], c.rot[2], c.rot[3]);
@@ -123,7 +113,7 @@ function applyCubes(cubes) {
     _m.compose(_p, _q, _s);
     inst.setMatrixAt(i, _m);
 
-    const col = hexToThreeColor(c.color || "#0f172a");
+    const col = hexToThreeColor(c.color || "#7dd3fc");
     inst.setColorAt(i, col);
   }
 
@@ -137,37 +127,29 @@ function applyCubes(cubes) {
   if (inst.instanceColor) inst.instanceColor.needsUpdate = true;
 }
 
-function applyProbes(probes) {
-  const arr = probes || [];
-  const n = Math.min(arr.length, MAX_PROBES);
+function applyTargetHint(hint) {
+  if (!hint || !hint.pos) return;
 
-  for (let i = 0; i < n; i++) {
-    const p = arr[i];
-    _p.set(p.pos[0], p.pos[1], p.pos[2]);
-    _q.identity();
-    _s.set(1.02, 1.02, 1.02);
+  const p = hint.pos;
+  const s = hint.scale || [1, 1, 1];
 
-    _m.compose(_p, _q, _s);
-    probeInst.setMatrixAt(i, _m);
+  targetMesh.position.set(p[0], p[1], p[2]);
+  targetWire.position.set(p[0], p[1], p[2]);
 
-    const alpha = (typeof p.alpha === "number") ? p.alpha : 0.22;
-    const col = new THREE.Color(0x22c55e).lerp(new THREE.Color(0x86efac), Math.min(1, Math.max(0, alpha)));
-    probeInst.setColorAt(i, col);
+  targetMesh.scale.set(s[0], s[1], s[2]);
+  targetWire.scale.set(s[0], s[1], s[2]);
+
+  if (hint.color) {
+    const c = hexToThreeColor(hint.color);
+    targetMesh.material.color.copy(c);
+    targetWire.material.color.copy(c);
+  }
+  if (typeof hint.alpha === "number") {
+    targetMesh.material.opacity = Math.max(0.02, Math.min(0.6, hint.alpha));
   }
 
-  for (let i = n; i < MAX_PROBES; i++) {
-    _m.identity();
-    _m.makeScale(0, 0, 0);
-    probeInst.setMatrixAt(i, _m);
-  }
-
-  probeInst.instanceMatrix.needsUpdate = true;
-  if (probeInst.instanceColor) probeInst.instanceColor.needsUpdate = true;
-}
-
-function applySnapshot(payload) {
-  applyCubes(payload.cubes || []);
-  applyProbes(payload.probes || []);
+  targetMesh.visible = true;
+  targetWire.visible = true;
 }
 
 function connectWS() {
@@ -199,9 +181,10 @@ function connectWS() {
     const payload = msg.payload || {};
 
     if (type === "SERVER_STATUS") {
+      lastStatus = payload;
       const run = payload.running ? "RUN" : "STOP";
       elStatus.innerText = `${run} | tick=${payload.tick} | cubes=${payload.cube_count}`;
-      elMeta.innerText = `session=${payload.session_id} | tick_hz=${payload.tick_hz} | max_cubes=${payload.max_cubes} | policy=${payload.policy || "-"}`;
+      elMeta.innerText = `session=${payload.session_id} | tick_hz=${payload.tick_hz} | max_cubes=${payload.max_cubes}`;
     }
 
     if (type === "STATE_SNAPSHOT") {
@@ -209,21 +192,25 @@ function connectWS() {
     }
 
     if (type === "ACTION_BATCH") {
-      const score = payload.score || 0;
+      lastScore = payload.score || 0;
       const actions = payload.actions || [];
-      if (actions.length > 0) {
-        const head = actions[0];
-        logLine(`tick=${payload.tick} score=${Number(score).toFixed(2)} actions=${actions.length} head=${head.type}`);
-      } else {
-        logLine(`tick=${payload.tick} score=${Number(score).toFixed(2)} actions=0`);
-      }
-    }
 
-    if (type === "ENGINE_EVENT") {
-      const lvl = payload.level || "info";
-      const message = payload.message || "";
-      const reason = payload.reason ? ` reason=${payload.reason}` : "";
-      logLine(`[${lvl}] ${message}${reason}`);
+      // 타겟 힌트 표시
+      const hint = actions.find(a => a.type === "HINT_TARGET");
+      if (hint) applyTargetHint(hint);
+
+      // 자동 리셋 로그
+      const ar = actions.find(a => a.type === "AUTO_RESET");
+      if (ar) logLine(`AUTO_RESET reason=${ar.reason || "unknown"}`);
+
+      // 로그 요약
+      const visibleActions = actions.filter(a => a.type !== "HINT_TARGET");
+      if (visibleActions.length > 0) {
+        const head = visibleActions[0];
+        logLine(`tick=${payload.tick} score=${lastScore.toFixed(2)} actions=${visibleActions.length} head=${head.type}`);
+      } else {
+        logLine(`tick=${payload.tick} score=${lastScore.toFixed(2)} actions=0`);
+      }
     }
   };
 }
