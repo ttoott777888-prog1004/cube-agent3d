@@ -15,11 +15,18 @@ function logLine(s) {
   elLog.innerText = `[${t}] ${s}\n` + elLog.innerText;
 }
 
-let ws = null;
+function hexToThreeColor(hex) {
+  return new THREE.Color(hex);
+}
 
-// --- Three.js
+let ws = null;
+let lastStatus = null;
+let lastTick = 0;
+let lastScore = 0;
+
+// --- Three.js scene
 const renderer = new THREE.WebGLRenderer({ canvas: elCanvas, antialias: true });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.setPixelRatio(window.devicePixelRatio || 1);
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0b0f17);
@@ -40,7 +47,9 @@ elZoomReset.addEventListener("click", () => {
   controls.update();
 });
 
-scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+const amb = new THREE.AmbientLight(0xffffff, 0.55);
+scene.add(amb);
+
 const dir = new THREE.DirectionalLight(0xffffff, 1.0);
 dir.position.set(10, 20, 10);
 scene.add(dir);
@@ -53,9 +62,12 @@ scene.add(grid);
 const MAX_INST = 256;
 const geom = new THREE.BoxGeometry(1, 1, 1);
 const mat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.65, metalness: 0.1 });
-const inst = new THREE.InstancedMesh(geom, mat, MAX_INST);
+let inst = new THREE.InstancedMesh(geom, mat, MAX_INST);
 inst.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+inst.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(MAX_INST * 3), 3);
 scene.add(inst);
+
+let currentCount = 0;
 
 const _m = new THREE.Matrix4();
 const _p = new THREE.Vector3();
@@ -64,9 +76,11 @@ const _s = new THREE.Vector3();
 
 function applySnapshot(payload) {
   const cubes = payload.cubes || [];
-  const count = Math.min(cubes.length, MAX_INST);
+  lastTick = payload.tick || 0;
 
-  for (let i = 0; i < count; i++) {
+  currentCount = Math.min(cubes.length, MAX_INST);
+
+  for (let i = 0; i < currentCount; i++) {
     const c = cubes[i];
 
     _p.set(c.pos[0], c.pos[1], c.pos[2]);
@@ -75,10 +89,12 @@ function applySnapshot(payload) {
 
     _m.compose(_p, _q, _s);
     inst.setMatrixAt(i, _m);
-    inst.setColorAt(i, new THREE.Color(c.color || "#7dd3fc"));
+
+    const col = hexToThreeColor(c.color || "#7dd3fc");
+    inst.setColorAt(i, col);
   }
 
-  for (let i = count; i < MAX_INST; i++) {
+  for (let i = currentCount; i < MAX_INST; i++) {
     _m.identity();
     _m.makeScale(0, 0, 0);
     inst.setMatrixAt(i, _m);
@@ -110,34 +126,49 @@ function connectWS() {
   };
 
   ws.onmessage = (ev) => {
-    let msg;
+    let msg = null;
     try { msg = JSON.parse(ev.data); } catch { return; }
 
     const type = msg.type;
     const payload = msg.payload || {};
 
     if (type === "SERVER_STATUS") {
+      lastStatus = payload;
       const run = payload.running ? "RUN" : "STOP";
       elStatus.innerText = `${run} | tick=${payload.tick} | cubes=${payload.cube_count}`;
       elMeta.innerText = `session=${payload.session_id} | tick_hz=${payload.tick_hz} | max_cubes=${payload.max_cubes}`;
-    } else if (type === "STATE_SNAPSHOT") {
+    }
+
+    if (type === "STATE_SNAPSHOT") {
       applySnapshot(payload);
-    } else if (type === "ACTION_BATCH") {
-      const score = payload.score || 0;
+    }
+
+    if (type === "ACTION_BATCH") {
+      lastScore = payload.score || 0;
       const actions = payload.actions || [];
-      logLine(`tick=${payload.tick} score=${score.toFixed(2)} actions=${actions.length}`);
+      if (actions.length > 0) {
+        const head = actions[0];
+        logLine(`tick=${payload.tick} score=${lastScore.toFixed(2)} actions=${actions.length} head=${head.type}`);
+      } else {
+        logLine(`tick=${payload.tick} score=${lastScore.toFixed(2)} actions=0`);
+      }
     }
   };
 }
 
 elStart.addEventListener("click", () => {
-  if (ws?.readyState === 1) ws.send(JSON.stringify({ type: "UI_START", payload: {} }));
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({ type: "UI_START", payload: {} }));
 });
+
 elStop.addEventListener("click", () => {
-  if (ws?.readyState === 1) ws.send(JSON.stringify({ type: "UI_STOP", payload: {} }));
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({ type: "UI_STOP", payload: {} }));
 });
+
 elReset.addEventListener("click", () => {
-  if (ws?.readyState === 1) ws.send(JSON.stringify({ type: "RESET", payload: {} }));
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({ type: "RESET", payload: {} }));
   logLine("RESET 요청");
 });
 
