@@ -10,7 +10,7 @@ from typing import Any
 
 from aiohttp import web, WSMsgType
 
-from ..agent.tower_policy import TowerPolicy
+from ..agent.engine import EnginePolicy
 from ..protocol.types import Bounds
 from ..scene.state import SceneState
 from ..storage.logger import SessionLogger
@@ -31,7 +31,10 @@ class Engine:
         self.bounds = Bounds()
         self.rng = random.Random(cfg.seed)
         self.state = SceneState(bounds=self.bounds, max_cubes=cfg.max_cubes, rng=self.rng)
-        self.policy = TowerPolicy()
+
+        # ✅ AI 정책 교체
+        self.policy = EnginePolicy()
+
         self.running = False
         self.ws_clients: set[web.WebSocketResponse] = set()
         self.logger = SessionLogger.create(cfg.session_root)
@@ -79,7 +82,7 @@ class Engine:
                     "tick": self.state.tick,
                     "cube_count": len(self.state.cubes),
                     "score": score,
-                    "note": "tower_policy",
+                    "note": "engine_policy",
                 })
                 self.logger.write_snapshot(self.state.snapshot())
 
@@ -93,6 +96,17 @@ class Engine:
 
             t = await ticker.sleep_next(t)
 
+    @staticmethod
+    def _min_center_y(scale_y: float) -> float:
+        # 바닥(y=0) 아래로 박히지 않게: center_y >= scale_y/2
+        try:
+            sy = float(scale_y)
+        except Exception:
+            sy = 1.0
+        if sy <= 0.0:
+            sy = 1.0
+        return 0.5 * sy
+
     def apply_actions(self, actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
         applied: list[dict[str, Any]] = []
 
@@ -102,26 +116,63 @@ class Engine:
             ok = False
 
             if t == "DUPLICATE":
+                source_id = str(a["source_id"])
+                new_id = str(a["new_id"])
+                offset = list(a["offset"])
+
+                # ✅ 바닥 아래 방지(오프셋 보정)
+                src = self.state.cubes.get(source_id)
+                if src is not None:
+                    target_y = float(src.pos[1]) + float(offset[1])
+                    min_y = self._min_center_y(src.scale[1])
+                    if target_y < min_y:
+                        offset[1] = min_y - float(src.pos[1])
+
                 ok = self.state.duplicate_cube(
-                    source_id=str(a["source_id"]),
-                    new_id=str(a["new_id"]),
-                    offset=list(a["offset"]),
+                    source_id=source_id,
+                    new_id=new_id,
+                    offset=offset,
                 )
+
             elif t == "MOVE":
+                cid = str(a["id"])
+                pos = list(a["pos"])
+
+                # ✅ 바닥 아래 방지(절대 위치 보정)
+                c = self.state.cubes.get(cid)
+                if c is not None:
+                    min_y = self._min_center_y(c.scale[1])
+                    if float(pos[1]) < min_y:
+                        pos[1] = min_y
+
                 ok = self.state.move_cube_abs(
-                    cid=str(a["id"]),
-                    pos=list(a["pos"]),
+                    cid=cid,
+                    pos=pos,
                 )
+
             elif t == "ROTATE_YAW":
                 ok = self.state.rotate_cube_yaw(
                     cid=str(a["id"]),
                     yaw_rad=float(a["yaw"]),
                 )
+
             elif t == "SCALE":
+                cid = str(a["id"])
+                scale = list(a["scale"])
+
                 ok = self.state.scale_cube_abs(
-                    cid=str(a["id"]),
-                    scale=list(a["scale"]),
+                    cid=cid,
+                    scale=scale,
                 )
+
+                # ✅ 스케일 바뀌면 바닥 규칙도 다시 보정(센터 y)
+                if ok:
+                    c = self.state.cubes.get(cid)
+                    if c is not None:
+                        min_y = self._min_center_y(c.scale[1])
+                        if float(c.pos[1]) < min_y:
+                            self.state.move_cube_abs(cid=cid, pos=[c.pos[0], min_y, c.pos[2]])
+
             elif t == "SET_COLOR":
                 ok = self.state.set_color(
                     cid=str(a["id"]),
@@ -129,6 +180,7 @@ class Engine:
                 )
 
             if ok:
+                # ✅ ghost 같은 추가 필드는 그대로 유지(웹에서 초록 투명 타겟 표시 가능)
                 applied.append(a)
 
         return applied
@@ -219,4 +271,3 @@ async def run_server(host: str, port: int, tick_hz: float, max_cubes: int, seed:
         except Exception:
             pass
         await runner.cleanup()
-
