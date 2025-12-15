@@ -1,5 +1,5 @@
-import * as THREE from "three";
-import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import * as THREE from "https://unpkg.com/three@0.160.0/build/three.module.js";
+import { OrbitControls } from "https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js";
 
 const elCanvas = document.getElementById("canvas");
 const elStart = document.getElementById("btnStart");
@@ -61,13 +61,37 @@ scene.add(grid);
 // Instanced cubes
 const MAX_INST = 256;
 const geom = new THREE.BoxGeometry(1, 1, 1);
-const mat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.65, metalness: 0.1 });
+
+const mat = new THREE.MeshStandardMaterial({
+  vertexColors: true,
+  roughness: 0.65,
+  metalness: 0.1,
+});
+
 let inst = new THREE.InstancedMesh(geom, mat, MAX_INST);
 inst.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
 inst.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(MAX_INST * 3), 3);
 scene.add(inst);
 
+// Ghost targets (green transparent)
+const MAX_GHOST = 128;
+const ghostMat = new THREE.MeshBasicMaterial({
+  color: 0x00ff66,
+  transparent: true,
+  opacity: 0.22,
+  depthWrite: false,
+});
+let ghostInst = new THREE.InstancedMesh(geom, ghostMat, MAX_GHOST);
+ghostInst.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+scene.add(ghostInst);
+
 let currentCount = 0;
+
+// Latest snapshot cache (for DUPLICATE offset -> absolute ghost position)
+const cubeById = new Map(); // id -> { pos:[x,y,z], scale:[sx,sy,sz] }
+
+// Ghost cache with TTL
+let ghosts = []; // {pos:[x,y,z], scale:[sx,sy,sz], until:number(ms)}
 
 const _m = new THREE.Matrix4();
 const _p = new THREE.Vector3();
@@ -77,6 +101,11 @@ const _s = new THREE.Vector3();
 function applySnapshot(payload) {
   const cubes = payload.cubes || [];
   lastTick = payload.tick || 0;
+
+  cubeById.clear();
+  for (const c of cubes) {
+    if (c && c.id != null) cubeById.set(String(c.id), { pos: c.pos, scale: c.scale });
+  }
 
   currentCount = Math.min(cubes.length, MAX_INST);
 
@@ -102,6 +131,70 @@ function applySnapshot(payload) {
 
   inst.instanceMatrix.needsUpdate = true;
   if (inst.instanceColor) inst.instanceColor.needsUpdate = true;
+}
+
+function pushGhost(pos, scale, ttlMs) {
+  const now = performance.now();
+  ghosts.push({
+    pos: [pos[0], pos[1], pos[2]],
+    scale: [scale[0], scale[1], scale[2]],
+    until: now + (ttlMs || 900),
+  });
+  if (ghosts.length > 256) ghosts = ghosts.slice(ghosts.length - 256);
+}
+
+function applyGhostActions(actions) {
+  for (const a of actions || []) {
+    if (!a || !a.type) continue;
+
+    // Prefer explicit hint from server policy
+    if (a.ghost && a.ghost.pos && a.ghost.scale) {
+      pushGhost(a.ghost.pos, a.ghost.scale, a.ghost.ttl_ms || 900);
+      continue;
+    }
+
+    // Derive from action payload
+    if (a.type === "MOVE" && Array.isArray(a.pos) && a.id != null) {
+      const id = String(a.id);
+      const cur = cubeById.get(id);
+      const sc = cur?.scale || [1, 1, 1];
+      pushGhost(a.pos, sc, 900);
+      continue;
+    }
+
+    if (a.type === "DUPLICATE" && a.source_id != null && Array.isArray(a.offset)) {
+      const src = cubeById.get(String(a.source_id));
+      if (!src) continue;
+      const p = [
+        src.pos[0] + a.offset[0],
+        src.pos[1] + a.offset[1],
+        src.pos[2] + a.offset[2],
+      ];
+      pushGhost(p, src.scale || [1, 1, 1], 900);
+      continue;
+    }
+  }
+}
+
+function updateGhostInstances() {
+  const now = performance.now();
+  ghosts = ghosts.filter(g => g.until > now);
+
+  const n = Math.min(ghosts.length, MAX_GHOST);
+  for (let i = 0; i < n; i++) {
+    const g = ghosts[i];
+    _p.set(g.pos[0], g.pos[1] + 0.01, g.pos[2]); // z-fighting 방지 미세 상승
+    _q.set(0, 0, 0, 1);
+    _s.set(g.scale[0], g.scale[1], g.scale[2]);
+    _m.compose(_p, _q, _s);
+    ghostInst.setMatrixAt(i, _m);
+  }
+  for (let i = n; i < MAX_GHOST; i++) {
+    _m.identity();
+    _m.makeScale(0, 0, 0);
+    ghostInst.setMatrixAt(i, _m);
+  }
+  ghostInst.instanceMatrix.needsUpdate = true;
 }
 
 function connectWS() {
@@ -146,6 +239,10 @@ function connectWS() {
     if (type === "ACTION_BATCH") {
       lastScore = payload.score || 0;
       const actions = payload.actions || [];
+
+      // 초록 투명 "탐색/목표" 위치 표시
+      applyGhostActions(actions);
+
       if (actions.length > 0) {
         const head = actions[0];
         logLine(`tick=${payload.tick} score=${lastScore.toFixed(2)} actions=${actions.length} head=${head.type}`);
@@ -185,6 +282,7 @@ resize();
 function animate() {
   requestAnimationFrame(animate);
   controls.update();
+  updateGhostInstances();
   renderer.render(scene, camera);
 }
 animate();
