@@ -10,9 +10,7 @@ const elStatus = document.getElementById("status");
 const elMeta = document.getElementById("meta");
 const elLog = document.getElementById("log");
 
-if (!elCanvas) {
-  throw new Error("canvas 요소(#canvas)를 찾을 수 없습니다. index.html을 확인하세요.");
-}
+if (!elCanvas) throw new Error("Missing #canvas");
 
 const LOG_MAX_LINES = 220;
 const logBuf = [];
@@ -28,13 +26,11 @@ function logLine(s) {
 function setStatusText(s) {
   if (elStatus) elStatus.innerText = s;
 }
-
 function setMetaText(s) {
   if (elMeta) elMeta.innerText = s;
 }
 
 function parseColor(c) {
-  // c: "#rrggbb" | "rgb(...)" | [r,g,b] (0~1 or 0~255)
   try {
     if (Array.isArray(c) && c.length >= 3) {
       const r = c[0] > 1 ? c[0] / 255 : c[0];
@@ -42,9 +38,7 @@ function parseColor(c) {
       const b = c[2] > 1 ? c[2] / 255 : c[2];
       return new THREE.Color(r, g, b);
     }
-    if (typeof c === "string" && c.trim().length > 0) {
-      return new THREE.Color(c);
-    }
+    if (typeof c === "string" && c.trim().length > 0) return new THREE.Color(c);
   } catch {}
   return new THREE.Color("#7dd3fc");
 }
@@ -53,7 +47,7 @@ let ws = null;
 let reconnectTimer = null;
 let reconnectDelayMs = 600;
 
-// --- Three.js scene
+// --- Three.js
 const renderer = new THREE.WebGLRenderer({ canvas: elCanvas, antialias: true, alpha: false });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
 
@@ -79,7 +73,6 @@ if (elZoomReset) {
 }
 
 scene.add(new THREE.AmbientLight(0xffffff, 0.55));
-
 const dir = new THREE.DirectionalLight(0xffffff, 1.0);
 dir.position.set(10, 20, 10);
 scene.add(dir);
@@ -95,18 +88,12 @@ scene.add(axes);
 // Instanced cubes
 const MAX_INST = 512;
 const geom = new THREE.BoxGeometry(1, 1, 1);
-const mat = new THREE.MeshStandardMaterial({
-  vertexColors: true,
-  roughness: 0.65,
-  metalness: 0.1,
-});
+const mat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.65, metalness: 0.1 });
 
 const inst = new THREE.InstancedMesh(geom, mat, MAX_INST);
 inst.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-// 색상 버퍼를 미리 준비 (setColorAt 사용)
 inst.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(MAX_INST * 3), 3);
 inst.instanceColor.setUsage(THREE.DynamicDrawUsage);
-
 scene.add(inst);
 
 const _m = new THREE.Matrix4();
@@ -116,17 +103,15 @@ const _s = new THREE.Vector3();
 
 function applySnapshot(payload) {
   const cubes = payload?.cubes || [];
-  const tick = payload?.tick ?? 0;
-
   const count = Math.min(cubes.length, MAX_INST);
+
   inst.count = count;
 
   for (let i = 0; i < count; i++) {
-    const c = cubes[i];
-
-    const pos = c?.pos || [0, 0, 0];
-    const rot = c?.rot || [0, 0, 0, 1];
-    const sca = c?.scale || [1, 1, 1];
+    const c = cubes[i] || {};
+    const pos = c.pos || [0, 0, 0];
+    const rot = c.rot || [0, 0, 0, 1];
+    const sca = c.scale || [1, 1, 1];
 
     _p.set(pos[0] || 0, pos[1] || 0, pos[2] || 0);
     _q.set(rot[0] || 0, rot[1] || 0, rot[2] || 0, rot[3] ?? 1);
@@ -134,18 +119,11 @@ function applySnapshot(payload) {
 
     _m.compose(_p, _q, _s);
     inst.setMatrixAt(i, _m);
-
-    inst.setColorAt(i, parseColor(c?.color));
+    inst.setColorAt(i, parseColor(c.color));
   }
 
   inst.instanceMatrix.needsUpdate = true;
   if (inst.instanceColor) inst.instanceColor.needsUpdate = true;
-
-  // 서버 상태 텍스트가 STOP일 때도 tick 표시가 갱신되도록 보조
-  // (서버에서 STOP 중에는 STATUS만 보내는 구조일 수 있어서)
-  if (tick !== undefined && elStatus && elStatus.innerText.includes("STOP")) {
-    // 유지: 필요 시만 표시가 자연스럽게 따라오도록
-  }
 }
 
 function setButtonsEnabled(connected) {
@@ -153,6 +131,15 @@ function setButtonsEnabled(connected) {
   if (elStop) elStop.disabled = !connected;
   if (elReset) elReset.disabled = !connected;
   if (elZoomReset) elZoomReset.disabled = !connected;
+}
+
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    reconnectDelayMs = Math.min(Math.floor(reconnectDelayMs * 1.4), 5000);
+    connectWS();
+  }, reconnectDelayMs);
 }
 
 function connectWS() {
@@ -207,28 +194,24 @@ function connectWS() {
       const run = payload.running ? "RUN" : "STOP";
       setStatusText(`${run} | tick=${payload.tick} | cubes=${payload.cube_count}`);
       setMetaText(`session=${payload.session_id} | tick_hz=${payload.tick_hz} | max_cubes=${payload.max_cubes}`);
-    } else if (type === "STATE_SNAPSHOT") {
+      return;
+    }
+
+    if (type === "STATE_SNAPSHOT") {
       applySnapshot(payload);
-    } else if (type === "ACTION_BATCH") {
+      return;
+    }
+
+    if (type === "ACTION_BATCH") {
       const score = payload.score ?? 0;
       const actions = payload.actions || [];
       if (actions.length > 0) {
-        const head = actions[0];
-        logLine(`tick=${payload.tick} score=${Number(score).toFixed(2)} actions=${actions.length} head=${head.type}`);
+        logLine(`tick=${payload.tick} score=${Number(score).toFixed(2)} actions=${actions.length} head=${actions[0].type}`);
       } else {
         logLine(`tick=${payload.tick} score=${Number(score).toFixed(2)} actions=0`);
       }
     }
   };
-}
-
-function scheduleReconnect() {
-  if (reconnectTimer) return;
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    reconnectDelayMs = Math.min(Math.floor(reconnectDelayMs * 1.4), 5000);
-    connectWS();
-  }, reconnectDelayMs);
 }
 
 if (elStart) {
@@ -237,14 +220,12 @@ if (elStart) {
     ws.send(JSON.stringify({ type: "UI_START", payload: {} }));
   });
 }
-
 if (elStop) {
   elStop.addEventListener("click", () => {
     if (!ws || ws.readyState !== 1) return;
     ws.send(JSON.stringify({ type: "UI_STOP", payload: {} }));
   });
 }
-
 if (elReset) {
   elReset.addEventListener("click", () => {
     if (!ws || ws.readyState !== 1) return;
