@@ -4,260 +4,305 @@ import math
 import random
 from collections import deque
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterable, Tuple
 
+from ..protocol.types import Bounds
 from ..scene.state import SceneState
 
 
+def _iter_cubes(state: SceneState) -> list[Any]:
+    cubes = getattr(state, "cubes", [])
+    if isinstance(cubes, dict):
+        return list(cubes.values())
+    if isinstance(cubes, (list, tuple)):
+        return list(cubes)
+    try:
+        return list(cubes)  # type: ignore[arg-type]
+    except Exception:
+        return []
+
+
+def _cube_id(c: Any) -> str:
+    if isinstance(c, dict):
+        return str(c.get("id", ""))
+    return str(getattr(c, "id", ""))
+
+
+def _cube_pos(c: Any) -> Tuple[int, int, int]:
+    if isinstance(c, dict):
+        p = c.get("pos", [0, 0, 0])
+    else:
+        p = getattr(c, "pos", [0, 0, 0])
+    if isinstance(p, (list, tuple)) and len(p) >= 3:
+        x, y, z = p[0], p[1], p[2]
+    else:
+        x, y, z = 0, 0, 0
+    return int(round(float(x))), int(round(float(y))), int(round(float(z)))
+
+
 @dataclass
+class PolicyConfig:
+    probe_n: int = 32
+
+    # 생성 위주: DUPLICATE 우선 확률
+    dup_prob: float = 0.92
+    # top-k 후보 중 랜덤 선택(한 방향으로 굳는 현상 방지)
+    pick_top_k: int = 10
+
+    # 정체/이상 감지(“스스로 이상하다”)
+    stuck_window: int = 120
+    # stuck_window 동안 cube_count 증가가 없으면 “정체”
+    no_growth_reset: bool = True
+    # head가 거의 안 움직이고(제자리) 성장도 없으면 “정체”
+    head_move_eps: float = 0.001
+    reset_cooldown: int = 80  # 리셋 직후 즉시 재리셋 방지
+
+    # 색상
+    color_on_dup: bool = True
+    color_on_move: bool = False
+
+
 class EnginePolicy:
     """
-    탐색/확장 정책:
-    - 3D 공간에서 (x,z) 전방위 + (y) 높이까지 목표(target)를 스스로 선택
-    - 목표 위치는 UI에서 '초록색 투명 상자'로 시각화 가능 (HINT_TARGET 액션)
-    - 바닥 아래(y<0)는 금지. (추가로 큐브 스케일을 고려해 중심 y를 보정)
-    - 일정 시간 동안 '위로만' 가거나 정체(stuck)로 판단되면 AUTO_RESET으로 상태 리셋
+    목표:
+    - “이동”보다 “생성(확장)” 우선
+    - 26방향 후보 생성 + 바닥(y<0) 금지 + 충돌 금지
+    - y>0은 아래 지지(support) 있는 후보를 강하게 선호 (공중부양 확장 방지)
+    - 후보(probes)를 프론트에 전달하여 초록 반투명 상자로 표시
+    - 정체/이상 감지 시 EPISODE_RESET 반환 (서버에서 자동 리셋 처리)
     """
-    # 행동 제약
-    max_actions_per_tick: int = 24
-    max_spawn_per_tick: int = 1
 
-    # 이동/탐색 파라미터
-    step_len: float = 0.55
-    target_hold_ticks: int = 18
-    target_reach_eps: float = 0.85
+    def __init__(self, rng: random.Random, cfg: PolicyConfig | None = None) -> None:
+        self.rng = rng
+        self.cfg = cfg or PolicyConfig()
 
-    # 리셋(자기점검) 파라미터
-    stuck_window: int = 64
-    stuck_move_eps: float = 0.03
-    up_only_dzdx_eps: float = 0.05
-    up_only_dy_min: float = 0.08
-    reset_cooldown: int = 60
+        self._last_probes: list[dict[str, Any]] = []
+        self._visited: set[Tuple[int, int, int]] = set()
 
-    def __post_init__(self) -> None:
-        self.rng = random.Random()
-        self._target: list[float] | None = None
-        self._target_tick: int = 0
-        self._visited: list[tuple[float, float, float]] = []
-        self._move_hist: deque[tuple[float, float, float]] = deque(maxlen=self.stuck_window)
         self._since_reset: int = 10_000
+        self._cube_count_hist: deque[int] = deque(maxlen=self.cfg.stuck_window)
+        self._head_pos_hist: deque[Tuple[int, int, int]] = deque(maxlen=self.cfg.stuck_window)
 
-    def seed(self, seed: int) -> None:
-        self.rng.seed(seed)
+        # “학습” (가벼운 강화): 26방향 오프셋 가중치
+        self._dir_w: dict[Tuple[int, int, int], float] = {}
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dz in (-1, 0, 1):
+                    if dx == dy == dz == 0:
+                        continue
+                    self._dir_w[(dx, dy, dz)] = 0.0
 
-    def decide(self, st: SceneState) -> list[dict[str, Any]]:
-        actions: list[dict[str, Any]] = []
+    def on_episode_reset(self) -> None:
+        # 학습 가중치는 유지(=리셋해도 “경험”은 남김), 방문 집합/히스토리는 정리
+        self._since_reset = 0
+        self._last_probes = []
+        self._visited.clear()
+        self._cube_count_hist.clear()
+        self._head_pos_hist.clear()
+        # 너무 한쪽으로 쏠리지 않게 약간 감쇠
+        for k in list(self._dir_w.keys()):
+            self._dir_w[k] *= 0.92
 
-        # 내부 카운터
+    def probes(self) -> list[dict[str, Any]]:
+        return self._last_probes
+
+    def observe(self, applied: list[dict[str, Any]]) -> None:
+        # 적용된 행동 기준으로 방향 가중치 업데이트(아주 단순)
+        for a in applied:
+            t = a.get("type")
+            if t == "DUPLICATE":
+                off = a.get("offset", [0, 0, 0])
+                if isinstance(off, (list, tuple)) and len(off) >= 3:
+                    dx, dy, dz = int(round(float(off[0]))), int(round(float(off[1]))), int(round(float(off[2])))
+                    key = (max(-1, min(1, dx)), max(-1, min(1, dy)), max(-1, min(1, dz)))
+                    if key in self._dir_w:
+                        self._dir_w[key] += 0.15
+            elif t == "MOVE":
+                self._dir_w[(0, 0, 1)] = self._dir_w.get((0, 0, 1), 0.0) + 0.01
+
+        # 폭주 방지 클램프
+        for k in list(self._dir_w.keys()):
+            if self._dir_w[k] > 2.5:
+                self._dir_w[k] = 2.5
+            if self._dir_w[k] < -2.5:
+                self._dir_w[k] = -2.5
+
+    def decide(self, state: SceneState, *, episode_cap: int, max_cubes: int) -> list[dict[str, Any]]:
         self._since_reset += 1
 
-        cubes = list(st.cubes.values())
+        cubes = _iter_cubes(state)
         if not cubes:
-            return actions
+            self._last_probes = []
+            return []
 
-        # ---- 자동 리셋 판단
-        if self._should_auto_reset(st):
-            self._since_reset = 0
-            self._move_hist.clear()
-            self._target = None
-            self._visited.clear()
-            return [{
-                "type": "AUTO_RESET",
-                "reason": "stuck_or_up_only",
+        cube_count = len(cubes)
+        if cube_count >= episode_cap:
+            return [{"type": "EPISODE_RESET", "reason": "cap_reached"}]
+
+        # head(확장 여지 많은 큐브) 선택
+        occ: set[Tuple[int, int, int]] = set(_cube_pos(c) for c in cubes)
+
+        def frontier_score(c: Any) -> int:
+            x, y, z = _cube_pos(c)
+            score = 0
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for dz in (-1, 0, 1):
+                        if dx == dy == dz == 0:
+                            continue
+                        nx, ny, nz = x + dx, y + dy, z + dz
+                        if ny < 0:
+                            continue
+                        if (nx, ny, nz) in occ:
+                            continue
+                        score += 1
+            return score
+
+        head = max(cubes, key=frontier_score)
+        head_id = _cube_id(head)
+        hx, hy, hz = _cube_pos(head)
+
+        # stuck/이상 감지용 히스토리 업데이트
+        self._cube_count_hist.append(cube_count)
+        self._head_pos_hist.append((hx, hy, hz))
+        if self._should_reset():
+            return [{"type": "EPISODE_RESET", "reason": "stuck_or_no_growth"}]
+
+        # Bounds
+        b = getattr(state, "bounds", Bounds())
+        x_min = int(getattr(b, "x_min", -60))
+        x_max = int(getattr(b, "x_max", 60))
+        y_min = int(max(0, int(getattr(b, "y_min", 0))))
+        y_max = int(getattr(b, "y_max", 120))
+        z_min = int(getattr(b, "z_min", -60))
+        z_max = int(getattr(b, "z_max", 60))
+
+        # 후보 생성 및 스코어링
+        cand: list[Tuple[float, Tuple[int, int, int], Tuple[int, int, int]]] = []
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dz in (-1, 0, 1):
+                    if dx == dy == dz == 0:
+                        continue
+                    nx, ny, nz = hx + dx, hy + dy, hz + dz
+
+                    if ny < 0:
+                        continue
+                    if nx < x_min or nx > x_max or nz < z_min or nz > z_max:
+                        continue
+                    if ny < y_min or ny > y_max:
+                        continue
+                    if (nx, ny, nz) in occ:
+                        continue
+
+                    support = 1 if ny == 0 else (1 if (nx, ny - 1, nz) in occ else 0)
+                    novelty = 1 if (nx, ny, nz) not in self._visited else 0
+
+                    # 생성 목적: “유효한 확장 + 다양성 + 퍼짐”을 우선
+                    spread = (abs(nx) + abs(nz)) * 0.08
+                    height = ny * 0.03
+
+                    w = self._dir_w.get((dx, dy, dz), 0.0)
+
+                    score = (support * 6.0) + (novelty * 2.2) + spread + height + (w * 0.6)
+                    score += self.rng.random() * 0.02
+
+                    # 공중 확장은 “보이기는 하되” 선택은 거의 안 되게
+                    if ny > 0 and support == 0:
+                        score -= 12.0
+
+                    cand.append((score, (nx, ny, nz), (dx, dy, dz)))
+
+        cand.sort(key=lambda t: t[0], reverse=True)
+
+        # probes: 상위 N개를 UI에 전달(초록 반투명 박스)
+        probes: list[dict[str, Any]] = []
+        for _, (px, py, pz), _ in cand[: self.cfg.probe_n]:
+            probes.append({
+                "pos": [px, py, pz],
+                "scale": [1.02, 1.02, 1.02],
+                "color": "#00ff66",
+                "alpha": 0.20,
+            })
+        self._last_probes = probes
+
+        if not cand:
+            return [{"type": "EPISODE_RESET", "reason": "no_candidates"}]
+
+        top_k = min(self.cfg.pick_top_k, len(cand))
+        _, (tx, ty, tz), (dx, dy, dz) = cand[self.rng.randrange(0, top_k)]
+
+        # “생성(복제)” 우선
+        can_dup = cube_count < max_cubes
+        if can_dup and self.rng.random() < self.cfg.dup_prob:
+            new_id = f"c{getattr(state, 'tick', 0)}_{self.rng.randrange(1_000_000)}"
+            self._visited.add((tx, ty, tz))
+
+            out: list[dict[str, Any]] = [{
+                "type": "DUPLICATE",
+                "source_id": head_id,
+                "new_id": new_id,
+                "offset": [dx, dy, dz],
             }]
 
-        # ---- 타겟 갱신
-        if self._target is None or (st.tick - self._target_tick) >= self.target_hold_ticks:
-            self._target = self._pick_target(st)
-            self._target_tick = st.tick
+            if self.cfg.color_on_dup:
+                out.append({
+                    "type": "SET_COLOR",
+                    "id": new_id,
+                    "color": self._rand_color(),
+                })
 
-        # 현재 기준 큐브(조작 대상) 선택: 최근 생성된 큐브를 우선
-        selected = self._pick_active_cube(st)
+            # head도 가끔 따라가서 다음 확장 방향을 바꾸게
+            if self.rng.random() < 0.25:
+                out.append({
+                    "type": "MOVE",
+                    "id": head_id,
+                    "pos": [tx, ty, tz],
+                })
 
-        # 타겟 도달 시 타겟 재생성
-        if self._dist3(selected.pos, self._target) <= self.target_reach_eps:
-            self._visited.append(tuple(self._target))
-            self._target = self._pick_target(st)
-            self._target_tick = st.tick
+            return out
 
-        # ---- UI 힌트(초록 투명 타겟)
-        actions.append({
-            "type": "HINT_TARGET",
-            "pos": [float(self._target[0]), float(self._target[1]), float(self._target[2])],
-            "scale": [1.02, 1.02, 1.02],
-            "color": "#00ff66",
-            "alpha": 0.20,
-        })
-
-        # ---- 복제(확장)
-        spawned_id: str | None = None
-        if len(st.cubes) < st.max_cubes and self.rng.random() < 0.28:
-            dx, dy, dz = self._dir_step(selected.pos, self._target, step=1.05)
-            new_id = st.next_id()
-            actions.append({
-                "type": "DUPLICATE",
-                "source_id": selected.id,
-                "new_id": new_id,
-                "offset": [dx, max(0.0, dy), dz],
-            })
-            spawned_id = new_id
-
-        # ---- 이동(전방위)
-        move_id = spawned_id if spawned_id is not None else selected.id
-        cur = st.cubes.get(move_id, selected)
-        nx, ny, nz = self._step_toward(st, cur.pos, cur.scale, self._target, self.step_len)
-        actions.append({
+        # 생성이 불가/억제된 경우에만 MOVE
+        self._visited.add((tx, ty, tz))
+        out2: list[dict[str, Any]] = [{
             "type": "MOVE",
-            "id": move_id,
-            "pos": [nx, ny, nz],
-        })
+            "id": head_id,
+            "pos": [tx, ty, tz],
+        }]
+        if self.cfg.color_on_move and self.rng.random() < 0.20:
+            out2.append({"type": "SET_COLOR", "id": head_id, "color": self._rand_color()})
+        return out2
 
-        # 이동 히스토리(자기점검)
-        self._move_hist.append((nx - cur.pos[0], ny - cur.pos[1], nz - cur.pos[2]))
-
-        # ---- 회전/스케일/색상 (가벼운 다양화)
-        if self.rng.random() < 0.9:
-            yaw = (st.tick * 0.07) + self.rng.uniform(-0.25, 0.25)
-            actions.append({
-                "type": "ROTATE_YAW",
-                "id": move_id,
-                "yaw": float(yaw),
-            })
-
-        if self.rng.random() < 0.22:
-            s = 0.85 + 0.35 * self.rng.random()
-            sy = 0.95 + 0.15 * self.rng.random()
-            actions.append({
-                "type": "SCALE",
-                "id": move_id,
-                "scale": [float(s), float(sy), float(s)],
-            })
-
-        if spawned_id is not None or self.rng.random() < 0.14:
-            actions.append({
-                "type": "SET_COLOR",
-                "id": move_id,
-                "color": self._rand_color(),
-            })
-
-        return actions[: self.max_actions_per_tick]
-
-    # ---------- 내부 유틸 ----------
-
-    def _pick_active_cube(self, st: SceneState):
-        best = None
-        best_int = -1
-        for k, v in st.cubes.items():
-            try:
-                i = int(k)
-            except Exception:
-                i = -1
-            if i > best_int:
-                best_int = i
-                best = v
-        if best is not None:
-            return best
-        return self.rng.choice(list(st.cubes.values()))
-
-    def _pick_target(self, st: SceneState) -> list[float]:
-        b = st.bounds
-
-        best: list[float] | None = None
-        best_score = -1e18
-
-        pad = 1.2
-        xmin, xmax = b.x_min + pad, b.x_max - pad
-        zmin, zmax = b.z_min + pad, b.z_max - pad
-        ymin = max(b.y_min + 0.55, 0.55)
-        ymax = max(ymin + 0.1, min(b.y_max - 0.55, b.y_max * 0.65))
-
-        cubes = list(st.cubes.values())
-
-        for _ in range(18):
-            x = self.rng.uniform(xmin, xmax)
-            z = self.rng.uniform(zmin, zmax)
-            y = self.rng.triangular(ymin, ymax, ymin + (ymax - ymin) * 0.35)
-
-            cand = [x, y, z]
-
-            if self._visited:
-                dv = min(self._dist3(cand, list(v)) for v in self._visited[-120:])
-            else:
-                dv = 5.0
-
-            if cubes:
-                dc = min(self._dist3(cand, c.pos) for c in cubes)
-            else:
-                dc = 5.0
-
-            py = max(0.0, (y - (ymin + ymax) * 0.5)) * 0.35
-
-            score = (dv * 0.75) + (dc * 0.35) - py
-            if score > best_score:
-                best_score = score
-                best = cand
-
-        if best is None:
-            best = [0.0, ymin, 0.0]
-
-        self._visited.append(tuple(best))
-        return [float(best[0]), float(best[1]), float(best[2])]
-
-    def _step_toward(self, st: SceneState, pos: list[float], scale: list[float], target: list[float], step: float) -> tuple[float, float, float]:
-        dx, dy, dz = self._dir_step(pos, target, step=step)
-        nx = pos[0] + dx
-        ny = pos[1] + dy
-        nz = pos[2] + dz
-
-        sy = float(scale[1]) if scale else 1.0
-        min_center_y = max(st.bounds.y_min + 0.5 * sy, 0.5 * sy)
-        if ny < min_center_y:
-            ny = min_center_y
-
-        nx = max(st.bounds.x_min, min(st.bounds.x_max, nx))
-        ny = max(st.bounds.y_min, min(st.bounds.y_max, ny))
-        nz = max(st.bounds.z_min, min(st.bounds.z_max, nz))
-
-        return float(nx), float(ny), float(nz)
-
-    def _dir_step(self, pos: list[float], target: list[float], step: float) -> tuple[float, float, float]:
-        vx = target[0] - pos[0]
-        vy = target[1] - pos[1]
-        vz = target[2] - pos[2]
-        d = math.sqrt(vx * vx + vy * vy + vz * vz)
-        if d <= 1e-9:
-            return 0.0, 0.0, 0.0
-        s = min(1.0, step / d)
-        return vx * s, vy * s, vz * s
-
-    def _dist3(self, a: list[float], b: list[float]) -> float:
-        dx = a[0] - b[0]
-        dy = a[1] - b[1]
-        dz = a[2] - b[2]
-        return math.sqrt(dx * dx + dy * dy + dz * dz)
-
-    def _should_auto_reset(self, st: SceneState) -> bool:
-        if self._since_reset < self.reset_cooldown:
+    def _should_reset(self) -> bool:
+        if self._since_reset < self.cfg.reset_cooldown:
             return False
 
-        if len(self._move_hist) < max(12, self.stuck_window // 3):
+        if len(self._cube_count_hist) < max(20, self.cfg.stuck_window // 3):
             return False
 
-        avg_move = sum(abs(dx) + abs(dy) + abs(dz) for dx, dy, dz in self._move_hist) / max(1, len(self._move_hist))
-        if avg_move < self.stuck_move_eps:
-            return True
+        if self.cfg.no_growth_reset:
+            mn = min(self._cube_count_hist)
+            mx = max(self._cube_count_hist)
+            if mx - mn <= 0:
+                return True
 
-        avg_dxz = sum(abs(dx) + abs(dz) for dx, dy, dz in self._move_hist) / max(1, len(self._move_hist))
-        avg_dy = sum(dy for dx, dy, dz in self._move_hist) / max(1, len(self._move_hist))
-        if avg_dxz < self.up_only_dzdx_eps and avg_dy > self.up_only_dy_min:
-            return True
+        # head 이동이 거의 없고(제자리) 동시에 성장도 없다면 reset
+        if len(self._head_pos_hist) >= 20:
+            x0, y0, z0 = self._head_pos_hist[0]
+            x1, y1, z1 = self._head_pos_hist[-1]
+            d = abs(x1 - x0) + abs(y1 - y0) + abs(z1 - z0)
+            if d <= self.cfg.head_move_eps:
+                mn = min(self._cube_count_hist)
+                mx = max(self._cube_count_hist)
+                if mx - mn <= 0:
+                    return True
 
         return False
 
     def _rand_color(self) -> str:
         h = self.rng.random()
-        s = 0.55 + 0.35 * self.rng.random()
-        v = 0.78 + 0.18 * self.rng.random()
+        s = 0.60 + 0.35 * self.rng.random()
+        v = 0.78 + 0.20 * self.rng.random()
         r, g, b = self._hsv_to_rgb(h, s, v)
         return f"#{r:02x}{g:02x}{b:02x}"
 
