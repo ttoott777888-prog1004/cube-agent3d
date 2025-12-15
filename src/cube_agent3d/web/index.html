@@ -1,32 +1,34 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="ko">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>cube-agent3d</title>
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
   <div id="wrap">
+    <canvas id="canvas"></canvas>
+
     <div id="hud">
-      <h1>cube-agent3d (v0.1.0)</h1>
+      <h1>Cube Agent 3D</h1>
 
       <div class="row">
-        <button id="btnStart">AI 실행</button>
-        <button id="btnStop" class="danger">정지</button>
-        <button id="btnReset">리셋</button>
+        <button id="btnStart">AI START</button>
+        <button id="btnStop">AI STOP</button>
+        <button id="btnReset" class="danger">RESET</button>
+        <button id="btnZoomReset">ZOOM RESET</button>
       </div>
 
-      <div class="row">
-        <button id="btnZoomReset">줌 리셋</button>
-        <div class="small" id="status">연결 중...</div>
+      <div class="row small">
+        <div id="status">연결 대기</div>
+      </div>
+      <div class="row small">
+        <div id="meta">-</div>
       </div>
 
-      <div class="small" id="meta"></div>
       <div id="log"></div>
     </div>
-
-    <canvas id="canvas"></canvas>
   </div>
 
   <script type="module" src="/app.js"></script>
