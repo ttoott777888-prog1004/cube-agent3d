@@ -1,273 +1,264 @@
-from __future__ import annotations
+import * as THREE from "https://esm.sh/three@0.160.0";
+import { OrbitControls } from "https://esm.sh/three@0.160.0/examples/jsm/controls/OrbitControls.js";
 
-import asyncio
-import json
-import random
-import time
-from dataclasses import dataclass
-from importlib import resources
-from typing import Any
+const elCanvas = document.getElementById("canvas");
+const elStart = document.getElementById("btnStart");
+const elStop = document.getElementById("btnStop");
+const elReset = document.getElementById("btnReset");
+const elZoomReset = document.getElementById("btnZoomReset");
+const elStatus = document.getElementById("status");
+const elMeta = document.getElementById("meta");
+const elLog = document.getElementById("log");
 
-from aiohttp import web, WSMsgType
+function logLine(s) {
+  const t = new Date().toLocaleTimeString();
+  elLog.innerText = `[${t}] ${s}\n` + elLog.innerText;
+}
 
-from ..agent.engine import EnginePolicy
-from ..protocol.types import Bounds
-from ..scene.state import SceneState
-from ..storage.logger import SessionLogger
-from .tick import Ticker
+function hexToThreeColor(hex) {
+  try { return new THREE.Color(hex); } catch { return new THREE.Color("#7dd3fc"); }
+}
 
+let ws = null;
 
-@dataclass
-class EngineConfig:
-    tick_hz: float
-    max_cubes: int
-    seed: int
-    session_root: str
+// --- Three.js scene
+const renderer = new THREE.WebGLRenderer({ canvas: elCanvas, antialias: true });
+renderer.setPixelRatio(window.devicePixelRatio || 1);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
 
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b0f17);
 
-class Engine:
-    def __init__(self, cfg: EngineConfig) -> None:
-        self.cfg = cfg
-        self.bounds = Bounds()
-        self.rng = random.Random(cfg.seed)
-        self.state = SceneState(bounds=self.bounds, max_cubes=cfg.max_cubes, rng=self.rng)
+const camera = new THREE.PerspectiveCamera(60, 1, 0.05, 500);
+camera.position.set(8, 8, 10);
 
-        # ✅ AI 정책 교체
-        self.policy = EnginePolicy()
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.minDistance = 3;
+controls.maxDistance = 80;
+controls.target.set(0, 4, 0);
 
-        self.running = False
-        self.ws_clients: set[web.WebSocketResponse] = set()
-        self.logger = SessionLogger.create(cfg.session_root)
-        self.state.reset()
+elZoomReset.addEventListener("click", () => {
+  camera.position.set(8, 8, 10);
+  controls.target.set(0, 4, 0);
+  controls.update();
+});
 
-    async def close(self) -> None:
-        self.logger.close()
+scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+const dir = new THREE.DirectionalLight(0xffffff, 1.0);
+dir.position.set(10, 20, 10);
+scene.add(dir);
 
-    def status_payload(self) -> dict[str, Any]:
-        return {
-            "running": self.running,
-            "tick": self.state.tick,
-            "cube_count": len(self.state.cubes),
-            "session_id": self.logger.session_id,
-            "session_dir": str(self.logger.session_dir),
-            "tick_hz": self.cfg.tick_hz,
-            "max_cubes": self.cfg.max_cubes,
-        }
+const grid = new THREE.GridHelper(60, 60, 0x223044, 0x121a27);
+grid.position.y = 0;
+scene.add(grid);
 
-    async def broadcast(self, msg_type: str, payload: dict[str, Any]) -> None:
-        dead: list[web.WebSocketResponse] = []
-        data = json.dumps({"type": msg_type, "payload": payload}, ensure_ascii=False)
-        for ws in list(self.ws_clients):
-            try:
-                await ws.send_str(data)
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
-            self.ws_clients.discard(ws)
+// ===== Instanced cubes (solid)
+let MAX_INST = 256;
 
-    async def engine_loop(self) -> None:
-        ticker = Ticker(self.cfg.tick_hz)
-        t = time.perf_counter()
-        while True:
-            if self.running:
-                actions = self.policy.decide(self.state)
-                applied = self.apply_actions(actions)
+const cubeGeom = new THREE.BoxGeometry(1, 1, 1);
+const cubeMat = new THREE.MeshStandardMaterial({
+  vertexColors: true,
+  roughness: 0.65,
+  metalness: 0.1,
+});
 
-                score = self.state.score_tower()
-                self.logger.write_actions({
-                    "tick": self.state.tick,
-                    "actions": applied,
-                })
-                self.logger.write_summary({
-                    "tick": self.state.tick,
-                    "cube_count": len(self.state.cubes),
-                    "score": score,
-                    "note": "engine_policy",
-                })
-                self.logger.write_snapshot(self.state.snapshot())
+let inst = new THREE.InstancedMesh(cubeGeom, cubeMat, MAX_INST);
+inst.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+inst.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(MAX_INST * 3), 3);
+scene.add(inst);
 
-                await self.broadcast("ACTION_BATCH", {"tick": self.state.tick, "actions": applied, "score": score})
-                await self.broadcast("STATE_SNAPSHOT", self.state.snapshot())
+let currentCount = 0;
 
-                self.state.step_age()
-                self.state.tick += 1
-            else:
-                await self.broadcast("SERVER_STATUS", self.status_payload())
+// ===== Probes (green transparent boxes)
+const MAX_PROBES = 64;
+const probeGeom = new THREE.BoxGeometry(1.02, 1.02, 1.02);
+const probeMat = new THREE.MeshBasicMaterial({
+  vertexColors: true,
+  transparent: true,
+  opacity: 0.22,
+  depthWrite: false,
+});
+let probeInst = new THREE.InstancedMesh(probeGeom, probeMat, MAX_PROBES);
+probeInst.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+probeInst.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(MAX_PROBES * 3), 3);
+scene.add(probeInst);
 
-            t = await ticker.sleep_next(t)
+const _m = new THREE.Matrix4();
+const _p = new THREE.Vector3();
+const _q = new THREE.Quaternion();
+const _s = new THREE.Vector3(1, 1, 1);
 
-    @staticmethod
-    def _min_center_y(scale_y: float) -> float:
-        # 바닥(y=0) 아래로 박히지 않게: center_y >= scale_y/2
-        try:
-            sy = float(scale_y)
-        except Exception:
-            sy = 1.0
-        if sy <= 0.0:
-            sy = 1.0
-        return 0.5 * sy
+function ensureCapacity(n) {
+  if (n <= MAX_INST) return;
 
-    def apply_actions(self, actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        applied: list[dict[str, Any]] = []
+  const newMax = Math.max(n, MAX_INST * 2, 256);
+  MAX_INST = newMax;
 
-        max_actions = 24
-        for a in actions[:max_actions]:
-            t = a.get("type")
-            ok = False
+  scene.remove(inst);
+  inst.dispose?.();
 
-            if t == "DUPLICATE":
-                source_id = str(a["source_id"])
-                new_id = str(a["new_id"])
-                offset = list(a["offset"])
+  inst = new THREE.InstancedMesh(cubeGeom, cubeMat, MAX_INST);
+  inst.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  inst.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(MAX_INST * 3), 3);
+  scene.add(inst);
 
-                # ✅ 바닥 아래 방지(오프셋 보정)
-                src = self.state.cubes.get(source_id)
-                if src is not None:
-                    target_y = float(src.pos[1]) + float(offset[1])
-                    min_y = self._min_center_y(src.scale[1])
-                    if target_y < min_y:
-                        offset[1] = min_y - float(src.pos[1])
+  logLine(`Instanced capacity expanded: ${MAX_INST}`);
+}
 
-                ok = self.state.duplicate_cube(
-                    source_id=source_id,
-                    new_id=new_id,
-                    offset=offset,
-                )
+function applyCubes(cubes) {
+  const arr = cubes || [];
+  ensureCapacity(arr.length);
 
-            elif t == "MOVE":
-                cid = str(a["id"])
-                pos = list(a["pos"])
+  currentCount = Math.min(arr.length, MAX_INST);
 
-                # ✅ 바닥 아래 방지(절대 위치 보정)
-                c = self.state.cubes.get(cid)
-                if c is not None:
-                    min_y = self._min_center_y(c.scale[1])
-                    if float(pos[1]) < min_y:
-                        pos[1] = min_y
+  for (let i = 0; i < currentCount; i++) {
+    const c = arr[i];
 
-                ok = self.state.move_cube_abs(
-                    cid=cid,
-                    pos=pos,
-                )
+    _p.set(c.pos[0], c.pos[1], c.pos[2]);
+    _q.set(c.rot[0], c.rot[1], c.rot[2], c.rot[3]);
+    _s.set(c.scale[0], c.scale[1], c.scale[2]);
 
-            elif t == "ROTATE_YAW":
-                ok = self.state.rotate_cube_yaw(
-                    cid=str(a["id"]),
-                    yaw_rad=float(a["yaw"]),
-                )
+    _m.compose(_p, _q, _s);
+    inst.setMatrixAt(i, _m);
 
-            elif t == "SCALE":
-                cid = str(a["id"])
-                scale = list(a["scale"])
+    const col = hexToThreeColor(c.color || "#0f172a");
+    inst.setColorAt(i, col);
+  }
 
-                ok = self.state.scale_cube_abs(
-                    cid=cid,
-                    scale=scale,
-                )
+  for (let i = currentCount; i < MAX_INST; i++) {
+    _m.identity();
+    _m.makeScale(0, 0, 0);
+    inst.setMatrixAt(i, _m);
+  }
 
-                # ✅ 스케일 바뀌면 바닥 규칙도 다시 보정(센터 y)
-                if ok:
-                    c = self.state.cubes.get(cid)
-                    if c is not None:
-                        min_y = self._min_center_y(c.scale[1])
-                        if float(c.pos[1]) < min_y:
-                            self.state.move_cube_abs(cid=cid, pos=[c.pos[0], min_y, c.pos[2]])
+  inst.instanceMatrix.needsUpdate = true;
+  if (inst.instanceColor) inst.instanceColor.needsUpdate = true;
+}
 
-            elif t == "SET_COLOR":
-                ok = self.state.set_color(
-                    cid=str(a["id"]),
-                    color=str(a["color"]),
-                )
+function applyProbes(probes) {
+  const arr = probes || [];
+  const n = Math.min(arr.length, MAX_PROBES);
 
-            if ok:
-                # ✅ ghost 같은 추가 필드는 그대로 유지(웹에서 초록 투명 타겟 표시 가능)
-                applied.append(a)
+  for (let i = 0; i < n; i++) {
+    const p = arr[i];
+    _p.set(p.pos[0], p.pos[1], p.pos[2]);
+    _q.identity();
+    _s.set(1.02, 1.02, 1.02);
 
-        return applied
+    _m.compose(_p, _q, _s);
+    probeInst.setMatrixAt(i, _m);
 
+    const alpha = (typeof p.alpha === "number") ? p.alpha : 0.22;
+    const col = new THREE.Color(0x22c55e).lerp(new THREE.Color(0x86efac), Math.min(1, Math.max(0, alpha)));
+    probeInst.setColorAt(i, col);
+  }
 
-async def run_server(host: str, port: int, tick_hz: float, max_cubes: int, seed: int, session_root: str) -> None:
-    cfg = EngineConfig(tick_hz=tick_hz, max_cubes=max_cubes, seed=seed, session_root=session_root)
-    engine = Engine(cfg)
+  for (let i = n; i < MAX_PROBES; i++) {
+    _m.identity();
+    _m.makeScale(0, 0, 0);
+    probeInst.setMatrixAt(i, _m);
+  }
 
-    app = web.Application()
+  probeInst.instanceMatrix.needsUpdate = true;
+  if (probeInst.instanceColor) probeInst.instanceColor.needsUpdate = true;
+}
 
-    async def _serve_pkg_file(pkg_rel: str, content_type: str, *, charset: str | None = None) -> web.Response:
-        with resources.files("cube_agent3d.web").joinpath(pkg_rel).open("rb") as f:
-            data = f.read()
-        # aiohttp: charset는 content_type 문자열에 포함하면 안 됨 (별도 인자)
-        if charset is not None:
-            return web.Response(body=data, content_type=content_type, charset=charset)
-        return web.Response(body=data, content_type=content_type)
+function applySnapshot(payload) {
+  applyCubes(payload.cubes || []);
+  applyProbes(payload.probes || []);
+}
 
-    async def index(request: web.Request) -> web.Response:
-        return await _serve_pkg_file("index.html", "text/html", charset="utf-8")
+function connectWS() {
+  const proto = (location.protocol === "https:") ? "wss" : "ws";
+  const url = `${proto}://${location.host}/ws`;
+  ws = new WebSocket(url);
 
-    async def app_js(request: web.Request) -> web.Response:
-        return await _serve_pkg_file("app.js", "application/javascript", charset="utf-8")
+  ws.onopen = () => {
+    elStatus.innerText = "연결됨";
+    ws.send(JSON.stringify({ type: "HELLO", payload: { client: "web" } }));
+    logLine("WebSocket 연결됨");
+  };
 
-    async def style_css(request: web.Request) -> web.Response:
-        return await _serve_pkg_file("style.css", "text/css", charset="utf-8")
+  ws.onclose = () => {
+    elStatus.innerText = "연결 끊김";
+    logLine("WebSocket 연결 끊김");
+    setTimeout(connectWS, 800);
+  };
 
-    async def ws_handler(request: web.Request) -> web.WebSocketResponse:
-        ws = web.WebSocketResponse(heartbeat=20)
-        await ws.prepare(request)
-        engine.ws_clients.add(ws)
+  ws.onerror = () => {
+    elStatus.innerText = "오류";
+  };
 
-        await ws.send_str(json.dumps({"type": "SERVER_STATUS", "payload": engine.status_payload()}, ensure_ascii=False))
-        await ws.send_str(json.dumps({"type": "STATE_SNAPSHOT", "payload": engine.state.snapshot()}, ensure_ascii=False))
+  ws.onmessage = (ev) => {
+    let msg = null;
+    try { msg = JSON.parse(ev.data); } catch { return; }
 
-        async for msg in ws:
-            if msg.type == WSMsgType.TEXT:
-                try:
-                    data = json.loads(msg.data)
-                except Exception:
-                    continue
+    const type = msg.type;
+    const payload = msg.payload || {};
 
-                mtype = data.get("type")
-                if mtype == "HELLO":
-                    await ws.send_str(json.dumps({"type": "SERVER_STATUS", "payload": engine.status_payload()}, ensure_ascii=False))
-                elif mtype == "UI_START":
-                    engine.running = True
-                    await engine.broadcast("SERVER_STATUS", engine.status_payload())
-                elif mtype == "UI_STOP":
-                    engine.running = False
-                    await engine.broadcast("SERVER_STATUS", engine.status_payload())
-                elif mtype == "RESET":
-                    engine.running = False
-                    engine.state.reset()
-                    await engine.broadcast("SERVER_STATUS", engine.status_payload())
-                    await engine.broadcast("STATE_SNAPSHOT", engine.state.snapshot())
-            elif msg.type == WSMsgType.ERROR:
-                break
+    if (type === "SERVER_STATUS") {
+      const run = payload.running ? "RUN" : "STOP";
+      elStatus.innerText = `${run} | tick=${payload.tick} | cubes=${payload.cube_count}`;
+      elMeta.innerText = `session=${payload.session_id} | tick_hz=${payload.tick_hz} | max_cubes=${payload.max_cubes} | policy=${payload.policy || "-"}`;
+    }
 
-        engine.ws_clients.discard(ws)
-        return ws
+    if (type === "STATE_SNAPSHOT") {
+      applySnapshot(payload);
+    }
 
-    app.add_routes([
-        web.get("/", index),
-        web.get("/app.js", app_js),
-        web.get("/style.css", style_css),
-        web.get("/ws", ws_handler),
-    ])
+    if (type === "ACTION_BATCH") {
+      const score = payload.score || 0;
+      const actions = payload.actions || [];
+      if (actions.length > 0) {
+        const head = actions[0];
+        logLine(`tick=${payload.tick} score=${Number(score).toFixed(2)} actions=${actions.length} head=${head.type}`);
+      } else {
+        logLine(`tick=${payload.tick} score=${Number(score).toFixed(2)} actions=0`);
+      }
+    }
 
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, host=host, port=port)
+    if (type === "ENGINE_EVENT") {
+      const lvl = payload.level || "info";
+      const message = payload.message || "";
+      const reason = payload.reason ? ` reason=${payload.reason}` : "";
+      logLine(`[${lvl}] ${message}${reason}`);
+    }
+  };
+}
 
-    loop_task = asyncio.create_task(engine.engine_loop())
+elStart.addEventListener("click", () => {
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({ type: "UI_START", payload: {} }));
+});
 
-    print(f"서버 시작: http://{host}:{port}")
-    print(f"세션: {engine.logger.session_id}  (저장 위치: {engine.logger.session_dir})")
+elStop.addEventListener("click", () => {
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({ type: "UI_STOP", payload: {} }));
+});
 
-    try:
-        await site.start()
-        while True:
-            await asyncio.sleep(3600)
-    finally:
-        loop_task.cancel()
-        try:
-            await engine.close()
-        except Exception:
-            pass
-        await runner.cleanup()
+elReset.addEventListener("click", () => {
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({ type: "RESET", payload: {} }));
+  logLine("RESET 요청");
+});
+
+function resize() {
+  const w = window.innerWidth;
+  const h = window.innerHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+}
+window.addEventListener("resize", resize);
+resize();
+
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+
+connectWS();
