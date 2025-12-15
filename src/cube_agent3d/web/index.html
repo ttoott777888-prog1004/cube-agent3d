@@ -5,7 +5,18 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Cube Agent 3D</title>
   <link rel="stylesheet" href="/style.css" />
+
+  <!-- 핵심: OrbitControls가 내부에서 "three"를 import하므로 importmap 필수 -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
 </head>
+
 <body>
   <div id="wrap">
     <div id="hud">
@@ -29,7 +40,6 @@
     <canvas id="canvas"></canvas>
   </div>
 
-  <!-- 반드시 type="module" -->
   <script type="module" src="/app.js"></script>
 </body>
 </html>
